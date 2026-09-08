@@ -32,3 +32,11 @@ go.work
 .claude/
 
 hermes-agent-helm-chart/
+# nix
+result
+result-*
+.go/
+
+# direnv
+.direnv/
+.envrc.local
