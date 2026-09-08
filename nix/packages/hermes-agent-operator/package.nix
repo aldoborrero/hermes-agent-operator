@@ -9,17 +9,17 @@ buildGoModule (finalAttrs: {
 
   inherit src;
 
-  vendorHash = "sha256-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
+  vendorHash = "sha256-+7HXfCW6znsfKSGdJa5Obb3ZmOkUyWwmy0XRP/cT1x0=";
 
   subPackages = [ "cmd" ];
 
-  # Matches the Dockerfile: a static binary reporting the same version string
-  # that the anonymous heartbeat sends.
+  # Static, like the Dockerfile's build. The symbol is `main.version`: cmd/ is
+  # a main package, so the linker knows it as `main`, not by its import path.
   env.CGO_ENABLED = 0;
   ldflags = [
     "-s"
     "-w"
-    "-X hermeum/hermes-agent-operator/cmd.version=${finalAttrs.version}"
+    "-X main.version=${finalAttrs.version}"
   ];
 
   # The unit suites start a real control plane through envtest, which needs

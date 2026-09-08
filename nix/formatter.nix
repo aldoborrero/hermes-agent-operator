@@ -56,11 +56,11 @@ let
     };
 
     settings.excludes = [
-      # controller-gen and kustomize own these; reformatting them makes every
-      # `make manifests` / `make build-installer` run show up as a diff.
-      "config/crd/bases/**"
-      "config/rbac/role.yaml"
-      "config/webhook/manifests.yaml"
+      # Trees a generator owns. kubebuilder scaffolds and refreshes config/,
+      # controller-gen writes the CRDs and RBAC inside it, and dist/ comes out
+      # of kustomize and the Helm plugin — reformatting any of them turns the
+      # next `make manifests` / `kubebuilder edit` into a conflict.
+      "config/**"
       "dist/**"
       "skills/hermes-agent-operator/crd.yaml"
     ];
