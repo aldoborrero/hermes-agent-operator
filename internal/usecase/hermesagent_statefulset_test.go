@@ -114,8 +114,9 @@ func TestBuildStatefulSetPodAnnotations(t *testing.T) {
 	})
 }
 
-func ptrBool(b bool) *bool { return &b }
-func ptrInt(i int) *int    { return &i }
+func ptrBool(b bool) *bool       { return &b }
+func ptrInt(i int) *int          { return &i }
+func ptrString(s string) *string { return &s }
 
 func TestBuildPluginsScript(t *testing.T) {
 
