@@ -1,8 +1,12 @@
 # hermes-agent-operator
 
-<p align="center"><img alt="Hermes Gopher" src="./img/hermes-agent-gopher.png" width="300" height="300"/></p>
+<p align="center"><img alt="Hermes Gopher" src="./img/hermes-agent-gopher.png" width="300" height="300"/>
 
-Self-hosting [Hermes agent](https://github.com/nousresearch/hermes-agent) on Kubernetes in a declarative, reproducible manner. 
+</p>
+
+Self-hosting [Hermes agent](https://github.com/nousresearch/hermes-agent) on Kubernetes in a declarative, reproducible manner.
+
+> **Note:** If you need a platform to manage Hermes agents for your team, check out [Hermeum](https://github.com/hermeum/hermeum) — it's built on this operator and adds a dashboard, templates, and shared credentials.
 
 ## Why
 
@@ -156,6 +160,8 @@ hermes:
 
 ### `hermes.storage`
 
+#### `persistence`
+
 Persistent volume for agent data at `/opt/data`. Without persistence, data is lost on pod restart.
 
 ```yaml
@@ -166,8 +172,50 @@ hermes:
       size: 10Gi                   # optional; defaults to 10Gi
       storageClassName: standard   # optional; omit to use the cluster default StorageClass
       existingClaim: my-pvc        # optional; omit to provision a new PVC automatically
+      existingSnapshot: my-snap    # optional; see `persistence.existingSnapshot` below
 ```
 
+Mount the agent data volume as a PVC restored from a [VolumeSnapshot](#snapshot), instead of provisioning a new empty PVC.
+
+```yaml
+hermes:
+  storage:
+    persistence:
+      existingSnapshot: hermes-data-my-agent-0-20260909030000  # must exist in this namespace and be ReadyToUse
+      storageClassName: standard   # optional; selects the restored PVC's class (omit for cluster default)
+```
+
+The snapshot must be `ReadyToUse`; otherwise a `RestoreFailed` condition is surfaced and the agent is left untouched. The operator provisions `<snapshot>-restore` (sized from the snapshot's `restoreSize`; `enabled`/`size` are ignored) while the agent keeps running, then deletes the StatefulSet once (its `volumeClaimTemplate` is immutable) so the restored volume mounts. Later changes — pointing at another snapshot, or reverting to an earlier one — are plain rolling updates. Snapshots are never deleted; the previous volume is left for you to clean up.
+
+#### `snapshot`
+
+Periodic CSI volume snapshots of the agent data PVC — the only state in the deployment that cannot be reproduced (sessions, skills, memories, `.env` history).
+
+> **Prerequisites:** your StorageClass must be backed by a CSI driver with snapshot support, and the cluster must run the [snapshot-controller](https://github.com/kubernetes-csi/external-snapshotter#installation) (VolumeSnapshot CRDs + controller from `kubernetes-csi/external-snapshotter`). Without it, the operator surfaces a `SnapshotUnsupported` condition instead of failing silently.
+
+```yaml
+hermes:
+  storage:
+    snapshot:                      # optional; omit to disable snapshots
+      enabled: true
+      schedule: "0 3 * * *"        # required when enabled; standard cron expression
+      retention: 3                 # optional; keep newest N snapshots, defaults to 3
+      volumeSnapshotClassName: my-class  # optional; omit to use the cluster default
+```
+
+Retained snapshots are listed in `status.snapshot`:
+
+```sh
+kubectl get hermesagent my-agent -o jsonpath='{.status.snapshot}'
+```
+
+To list the VolumeSnapshot objects of an agent directly:
+
+```sh
+kubectl get volumesnapshots -l agents.hermeum.app/agent=my-agent
+```
+
+Restore back into the agent with [`persistence.existingSnapshot`](#persistenceexistingsnapshot).
 
 ### `hermes.workspace`
 
@@ -203,7 +251,6 @@ hermes:
       secretRef:
         name: my-env-secret        # secret values; overrides configMap on key collision
 ```
-
 
 ### `hermes.packages`
 
@@ -276,7 +323,6 @@ hermes:
         export PATH="$HERMES_HOME/.npm-packages/bin:$PATH"
 ```
 
-
 ### `hermes.terminal`
 
 Runs each agent shell command in a **session pod** created through the Kubernetes
@@ -342,7 +388,6 @@ Two things the operator deliberately leaves to you:
   inherit the agent's SCC. Give them their own namespace with Pod Security
   Admission enforcing `restricted` if you need them genuinely confined.
 
-
 ### `hermes.plugins`
 
 Install Hermes plugins at startup. Use `owner/repo` shorthand or a full Git URL.
@@ -353,7 +398,6 @@ hermes:
     - identifier: hermes-agent/plugin-stocks  # required; owner/repo or full Git URL
       enable: true                 # optional; defaults to true (auto-enable after install)
 ```
-
 
 ### `hermes.skills`
 
@@ -367,7 +411,6 @@ hermes:
       name: stocks                 # optional; overrides the skill name from SKILL.md frontmatter
       force: false                 # optional; set true to install despite a blocked scan verdict
 ```
-
 
 ### `hermes.crons`
 
@@ -389,7 +432,6 @@ hermes:
       profile: default             # optional; Hermes profile name to run under
 ```
 
-
 ### `hermes.bundles`
 
 Define slash-command bundles that group related skills under a single name.
@@ -404,7 +446,6 @@ hermes:
       instruction: Use these tools for financial queries  # optional; prepended to skill content
       force: false                 # optional; set true to overwrite an existing bundle with the same name
 ```
-
 
 ### `hermes.env` / `hermes.envFrom`
 
@@ -422,7 +463,6 @@ hermes:
         name: my-agent-config
 ```
 
-
 ### `hermes.resources`
 
 CPU and memory for the agent container. Defaults: limits `2 CPU / 4Gi`, requests `500m / 1Gi`.
@@ -438,7 +478,6 @@ hermes:
       memory: 1Gi
 ```
 
-
 ### `hermes.initChownData`
 
 Run an init container that sets `/opt/data` ownership to the hermes user (`10000:10000`). Useful when using an existing PVC whose data was written by a different user.
@@ -449,7 +488,6 @@ Run an init container that sets `/opt/data` ownership to the hermes user (`10000
 hermes:
   initChownData: true              # optional; defaults to false
 ```
-
 
 ### `hermes.initScripts`
 
@@ -471,7 +509,6 @@ hermes:
 ```
 
 Use `spec.initContainers` instead when you need a different image, custom volume mounts, or fine-grained resource limits on the init step.
-
 
 ### `hermes.profiles`
 
@@ -508,7 +545,6 @@ hermes:
 ```
 
 > **Tip:** Use `workspace.dotEnv` on each profile to load environment variables from a ConfigMap and/or Secret. This is the recommended way to isolate credentials and configuration (e.g. API keys, tokens) per profile without leaking them across profiles.
-
 
 ### `searxng`
 
@@ -549,7 +585,6 @@ searxng:
       value: "4"
 ```
 
-
 ### `camofox`
 
 Optional sidecar for browser automation via [Camofox](https://github.com/jo-inc/camofox-browser). When enabled, `CAMOFOX_URL` is automatically injected into the agent container.
@@ -577,7 +612,6 @@ camofox:
       value: ":99"
 ```
 
-
 ### `security.rbac`
 
 ServiceAccount and Role configuration. A ServiceAccount is created by default.
@@ -594,7 +628,6 @@ security:
         resources: ["secrets"]
         verbs: ["get", "list"]
 ```
-
 
 ### `security.networkPolicy`
 
@@ -619,7 +652,6 @@ security:
             protocol: TCP
 ```
 
-
 ### `networking.service`
 
 Service configuration for the agent. Ports defined by `hermes.config.apiServer` and `hermes.config.webhook` are automatically exposed — use `ports` only for additional ports beyond those.
@@ -636,7 +668,6 @@ networking:
         targetPort: 9090           # optional; defaults to port
         protocol: TCP              # optional; TCP (default) | UDP | SCTP
 ```
-
 
 ### `networking.ingress`
 
@@ -661,7 +692,6 @@ networking:
         secretName: agent-tls
 ```
 
-
 ### `suspend`
 
 Pause the agent by scaling its StatefulSet to 0 without deleting the resource or its data.
@@ -669,7 +699,6 @@ Pause the agent by scaling its StatefulSet to 0 without deleting the resource or
 ```yaml
 suspend: true                      # optional; defaults to false
 ```
-
 
 ### `podAnnotations`
 
@@ -680,7 +709,6 @@ podAnnotations:                      # optional
   rotatedAt: "2026-07-06T12:00:00Z"  # any change here triggers a rolling restart
   prometheus.io/scrape: "true"       # also usable for ordinary pod annotations
 ```
-
 
 ## Heartbeat
 
@@ -703,7 +731,6 @@ helm upgrade hermes-agent-operator oci://ghcr.io/hermeum/charts/hermes-agent-ope
 
 or run the manager with `--heartbeat-disabled`.
 
-
 ## FAQ
 
 **Q: How are things self-installed by Hermes managed via the custom resource?**
@@ -717,7 +744,6 @@ Only the `HERMES_HOME` path (`/opt/data`) is persisted across pod restarts. Anyt
 **Q: Why does the Hermes container run as root?**
 
 The official Hermes image uses [s6-overlay](https://github.com/just-containers/s6-overlay), which requires the process to start as root for service supervision setup. Once initialisation is complete, s6-overlay drops privileges and runs the agent as the `hermes` user (`10000:10000`).
-
 
 ## Contributing
 

@@ -24,8 +24,11 @@ import (
 const (
 	hermesContainerName          = "hermes-agent"
 	hermesWorkspacePathSeparator = "--"
-	hermesDefaultProfile         = "default"
-	annotationDesiredSpecHash    = domain + "/desired-spec-hash"
+	// hermesHomeVolume is the StatefulSet volumeClaimTemplate name for the agent
+	// data PVC. Package-level so other reconcilers (e.g. snapshots) can share it.
+	hermesHomeVolume          = "hermes-data"
+	hermesDefaultProfile      = "default"
+	annotationDesiredSpecHash = domain + "/desired-spec-hash"
 	// searxngURL is the in-pod URL the hermes-agent uses to reach the SearXNG sidecar.
 	searxngURL = "http://localhost:8080"
 	// camofoxURL is the in-pod URL the hermes-agent uses to reach the Camofox sidecar.
@@ -37,7 +40,13 @@ const (
 // is disabled or moved to another port.
 var hermesHealthCheckCommand = []string{"hermes", "gateway", "status"}
 
-func (u *HermesAgentUseCase) reconcileStatefulSet(ctx context.Context, ha *agentsv1alpha1.HermesAgent) (ctrl.Result, error) {
+func (u *HermesAgentUseCase) reconcileStatefulSet(ctx context.Context, ha *agentsv1alpha1.HermesAgent) (result ctrl.Result, err error) {
+	defer func() {
+		if err != nil {
+			err = u.markReconcileFailed(ctx, ha, condReasonStatefulSetFailed, err)
+		}
+	}()
+
 	nsName := types.NamespacedName{Namespace: ha.Namespace, Name: ha.Name}
 
 	sts, err := u.kube.GetStatefulSet(ctx, GetStatefulSetParam{
@@ -94,6 +103,10 @@ func (u *HermesAgentUseCase) reconcileStatefulSet(ctx context.Context, ha *agent
 
 	ha.Status.ManagedResources.StatefulSet = ha.Name
 	ha.Status.Phase, ha.Status.Reason = u.deriveStatus(ctx, ha)
+	// The StatefulSet loop runs after every other resource loop, so reaching
+	// this point means all managed resources reconciled. Workload readiness
+	// itself is tracked by status.phase, not by this condition.
+	u.markReady(ctx, ha)
 	if err := u.kube.UpdateHermesAgentStatus(ctx, UpdateHermesAgentStatusParam{HermesAgent: ha}); err != nil {
 		return ctrl.Result{RequeueAfter: 30 * time.Second}, err
 	}
@@ -296,7 +309,6 @@ func buildInitContainerSecurityContext() *corev1.SecurityContext {
 //nolint:gocyclo // inherent to the breadth of init containers and volume wiring
 func buildHermesContainer(ha *agentsv1alpha1.HermesAgent, sts *appsv1.StatefulSet) *appsv1.StatefulSet {
 	const (
-		hermesHomeVolume      = "hermes-data"
 		hermesHomeMount       = "/opt/data"
 		hermesDSHMVolume      = "dshm"
 		hermesDSHMMount       = "/dev/shm"
@@ -413,7 +425,7 @@ func buildHermesContainer(ha *agentsv1alpha1.HermesAgent, sts *appsv1.StatefulSe
 		})
 	}
 
-	// persistence: existingClaim > enabled PVC > emptyDir fallback.
+	// persistence: existingClaim > existingSnapshot PVC > enabled PVC > emptyDir fallback.
 	hp := ha.GetHermes().GetPersistence()
 	if ec := hp.GetExistingClaim(); ec != "" {
 		volumes = append(volumes, corev1.Volume{
@@ -421,6 +433,15 @@ func buildHermesContainer(ha *agentsv1alpha1.HermesAgent, sts *appsv1.StatefulSe
 			VolumeSource: corev1.VolumeSource{
 				PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{
 					ClaimName: ec,
+				},
+			},
+		})
+	} else if es := hp.GetExistingSnapshot(); es != "" {
+		volumes = append(volumes, corev1.Volume{
+			Name: hermesHomeVolume,
+			VolumeSource: corev1.VolumeSource{
+				PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{
+					ClaimName: buildRestoredPVCName(es),
 				},
 			},
 		})

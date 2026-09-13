@@ -1,0 +1,26 @@
+apiVersion: agents.hermeum.app/v1alpha1
+kind: HermesAgent
+metadata:
+  name: hermesagent-sample-snapshot
+spec:
+  hermes:
+    storage:
+      persistence:
+        enabled: true
+        size: 10Gi
+        # --- Restore from a backup (issue #82) ---
+        # Uncomment to mount the agent data volume as a PVC restored from
+        # an existing VolumeSnapshot. The snapshot must exist in this
+        # namespace and be ReadyToUse; the restored PVC is managed by the
+        # operator, sized from the snapshot's restoreSize, and named
+        # <snapshot>-restore. The operator provisions it while the agent
+        # keeps running, then rolls the agent onto it (removing the
+        # StatefulSet once, since its volumeClaimTemplate is immutable).
+        # The previous volume is left in place — cleaning it up is up to
+        # you. The snapshot itself is never modified or deleted.
+        # existingSnapshot: hermes-data-hermesagent-sample-snapshot-0-20260909030000
+      snapshot:
+        enabled: true
+        schedule: "0 3 * * *"        # daily at 03:00
+        retention: 7                 # keep newest 7 snapshots
+        # volumeSnapshotClassName: my-snapshot-class  # optional; falls back to cluster default
