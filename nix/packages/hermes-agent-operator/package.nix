@@ -5,11 +5,11 @@
 }:
 buildGoModule (finalAttrs: {
   pname = "hermes-agent-operator";
-  version = "0.7.0"; # keep in sync with dist/chart/Chart.yaml `appVersion`
+  version = "0.10.0"; # keep in sync with dist/chart/Chart.yaml `appVersion`
 
   inherit src;
 
-  vendorHash = "sha256-+7HXfCW6znsfKSGdJa5Obb3ZmOkUyWwmy0XRP/cT1x0=";
+  vendorHash = "sha256-MrJfYhacrqCM+AdyEvnroFmx7XIGwLpuIY15p3k9FF0=";
 
   subPackages = [ "cmd" ];
 
