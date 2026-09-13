@@ -330,19 +330,15 @@ func TestBuildSessionPodNetworkPolicy(t *testing.T) {
 		}
 	})
 
-	t.Run("additional egress is appended", func(t *testing.T) {
+	t.Run("egress is DNS plus internet and nothing else", func(t *testing.T) {
+		// There is no additionalEgress knob here on purpose: NetworkPolicies are
+		// additive, so a second policy selecting the same pods adds its rules,
+		// and a second copy of NetworkPolicyEgressRule's schema would cost ~28 KB
+		// on a CRD that is already near the 256 KiB apply ceiling.
 		k := &agentsv1alpha1.HermesTerminalKubernetes{}
-		extra := networkingv1.NetworkPolicyEgressRule{
-			To: []networkingv1.NetworkPolicyPeer{{
-				IPBlock: &networkingv1.IPBlock{CIDR: "10.42.0.0/16"},
-			}},
-		}
-		np := buildSessionPodNetworkPolicy(terminalHA(k), k, &agentsv1alpha1.SessionPodNetworkPolicy{
-			AdditionalEgress: []networkingv1.NetworkPolicyEgressRule{extra},
-		})
-		last := np.Spec.Egress[len(np.Spec.Egress)-1]
-		if len(last.To) == 0 || last.To[0].IPBlock == nil || last.To[0].IPBlock.CIDR != "10.42.0.0/16" {
-			t.Errorf("additional egress not appended: %v", np.Spec.Egress)
+		np := buildSessionPodNetworkPolicy(terminalHA(k), k, nil)
+		if len(np.Spec.Egress) != 2 {
+			t.Errorf("expected exactly DNS + internet egress, got %d rules: %v", len(np.Spec.Egress), np.Spec.Egress)
 		}
 	})
 }

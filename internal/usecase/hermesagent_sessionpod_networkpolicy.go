@@ -116,7 +116,7 @@ func buildSessionPodEgress(np *agentsv1alpha1.SessionPodNetworkPolicy) []network
 	udp := corev1.ProtocolUDP
 	tcp := corev1.ProtocolTCP
 
-	rules := make([]networkingv1.NetworkPolicyEgressRule, 0, len(np.GetAdditionalEgress())+2)
+	rules := make([]networkingv1.NetworkPolicyEgressRule, 0, 2)
 
 	dns := intstr.FromInt32(53)
 	// 5353 is not optional on OpenShift: OVN-Kubernetes applies egress ACLs
@@ -150,6 +150,5 @@ func buildSessionPodEgress(np *agentsv1alpha1.SessionPodNetworkPolicy) []network
 		})
 	}
 
-	rules = append(rules, np.GetAdditionalEgress()...)
 	return rules
 }

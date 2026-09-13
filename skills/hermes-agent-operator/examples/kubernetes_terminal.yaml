@@ -90,6 +90,10 @@ spec:
           # Sessions usually need pip, npm and git. Everything inside
           # excludedEgressCIDRs stays closed — add your node, API server or
           # service ranges if they sit on publicly routable addresses.
+          #
+          # To reach a cluster-internal service, apply your own NetworkPolicy
+          # selecting the same labels: policies are additive, so its egress
+          # rules join the ones below.
           allowInternet: true
     workspace:
       dotEnv:
