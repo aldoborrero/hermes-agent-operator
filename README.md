@@ -352,8 +352,15 @@ hermes:
         enabled: true              # optional; default-deny plus DNS for the session pods
         allowInternet: true        # optional; egress outside excludedEgressCIDRs
         excludedEgressCIDRs: []    # optional; defaults to RFC1918 plus link-local
-        additionalEgress: []       # optional; extra egress rules
 ```
+
+There is deliberately no `additionalEgress` here, unlike under
+`security.networkPolicy`. NetworkPolicies are additive: to let a session reach a
+cluster-internal service, apply your own NetworkPolicy selecting the same
+`ownedSelector` labels and its egress rules join these. Embedding a second copy
+of the egress-rule schema would cost ~28 KB on a CRD already close to the
+256 KiB ceiling that `kubectl apply` puts on its last-applied-configuration
+annotation.
 
 Enabling the backend makes the operator do three things the agent cannot do for
 itself:

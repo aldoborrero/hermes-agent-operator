@@ -1814,10 +1814,13 @@ type SessionPodNetworkPolicy struct {
 	// +optional
 	ExcludedEgressCIDRs []string `json:"excludedEgressCIDRs,omitempty"`
 
-	// additionalEgress appends custom egress rules, for cluster-internal
-	// services a session legitimately needs.
-	// +optional
-	AdditionalEgress []networkingv1.NetworkPolicyEgressRule `json:"additionalEgress,omitempty"`
+	// There is deliberately no additionalEgress here, unlike under
+	// security.networkPolicy. NetworkPolicies are additive: a second policy
+	// selecting the same session pods contributes its egress rules to this
+	// one, so the capability is a plain manifest away. Embedding a second copy
+	// of NetworkPolicyEgressRule's schema costs ~28 KB of CRD, and this CRD is
+	// already within a few KB of the 256 KiB ceiling that `kubectl apply` puts
+	// on its last-applied-configuration annotation.
 }
 
 func (h *Hermes) GetTerminal() *HermesTerminal {
@@ -1913,13 +1916,6 @@ func (n *SessionPodNetworkPolicy) GetExcludedEgressCIDRs() []string {
 		return defaultExcludedEgressCIDRs()
 	}
 	return n.ExcludedEgressCIDRs
-}
-
-func (n *SessionPodNetworkPolicy) GetAdditionalEgress() []networkingv1.NetworkPolicyEgressRule {
-	if n == nil {
-		return nil
-	}
-	return n.AdditionalEgress
 }
 
 const (
