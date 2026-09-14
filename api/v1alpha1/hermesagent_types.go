@@ -1422,11 +1422,13 @@ func (p *CamofoxPersistenceSpec) GetSize() resource.Quantity {
 }
 
 // defaultEgressImageRepository is the default iron-proxy image repository.
-const defaultEgressImageRepository = "ghcr.io/ironsh/iron-proxy"
+// iron-proxy publishes to Docker Hub (docker.io/ironsh/iron-proxy); there is no
+// ghcr.io mirror.
+const defaultEgressImageRepository = "docker.io/ironsh/iron-proxy"
 
 // defaultEgressImageTag pins the iron-proxy image tag. Bump deliberately when
-// validating a newer release.
-const defaultEgressImageTag = "v0.49.0"
+// validating a newer release. Docker Hub tags have no leading "v".
+const defaultEgressImageTag = "0.49.0"
 
 // DefaultEgressTunnelPort is the port iron-proxy's explicit-proxy tunnel
 // listener binds on. The agent points HTTPS_PROXY/HTTP_PROXY at
@@ -1495,7 +1497,7 @@ type EgressInject struct {
 
 // EgressImageSpec specifies the iron-proxy container image repository and tag.
 type EgressImageSpec struct {
-	// repository is the image repository. Defaults to "ghcr.io/ironsh/iron-proxy".
+	// repository is the image repository. Defaults to "docker.io/ironsh/iron-proxy".
 	// +optional
 	Repository string `json:"repository,omitempty"`
 	// tag is the image tag. Defaults to a pinned iron-proxy version.

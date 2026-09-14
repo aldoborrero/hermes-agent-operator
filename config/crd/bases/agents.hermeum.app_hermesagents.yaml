@@ -339,7 +339,7 @@ spec:
                     properties:
                       repository:
                         description: repository is the image repository. Defaults
-                          to "ghcr.io/ironsh/iron-proxy".
+                          to "docker.io/ironsh/iron-proxy".
                         type: string
                       tag:
                         description: tag is the image tag. Defaults to a pinned iron-proxy
