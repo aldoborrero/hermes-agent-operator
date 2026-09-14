@@ -1421,6 +1421,152 @@ func (p *CamofoxPersistenceSpec) GetSize() resource.Quantity {
 	return resource.MustParse("1Gi")
 }
 
+// defaultEgressImageRepository is the default iron-proxy image repository.
+// iron-proxy publishes to Docker Hub (docker.io/ironsh/iron-proxy); there is no
+// ghcr.io mirror.
+const defaultEgressImageRepository = "docker.io/ironsh/iron-proxy"
+
+// defaultEgressImageTag pins the iron-proxy image tag. Bump deliberately when
+// validating a newer release. Docker Hub tags have no leading "v".
+const defaultEgressImageTag = "0.49.0"
+
+// DefaultEgressTunnelPort is the port iron-proxy's explicit-proxy tunnel
+// listener binds on. The agent points HTTPS_PROXY/HTTP_PROXY at
+// http://localhost:<port>. A high (non-privileged) port is used deliberately so
+// the sidecar needs no NET_BIND_SERVICE capability.
+const DefaultEgressTunnelPort = int32(8080)
+
+// DefaultEgressHeader is the header injected when an EgressInject rule omits one.
+const DefaultEgressHeader = "Authorization"
+
+// DefaultEgressFormatter is the Go-template formatter applied to an injected
+// credential when an EgressInject rule omits one.
+const DefaultEgressFormatter = "Bearer {{ .Value }}"
+
+// Egress configures an outbound credential-injection proxy (iron-proxy) sidecar.
+// When enabled, the operator runs iron-proxy alongside the hermes-agent
+// container and points the agent's HTTPS_PROXY/HTTP_PROXY at it. iron-proxy
+// enforces a default-deny egress allowlist and injects real API credentials per
+// destination host, so the real credentials live only in the sidecar and never
+// in the agent container.
+type Egress struct {
+	// Enabled turns on the iron-proxy egress sidecar.
+	// +optional
+	Enabled *bool `json:"enabled,omitempty"`
+	// Image configures the iron-proxy container image.
+	// +optional
+	Image EgressImageSpec `json:"image,omitempty"`
+	// Resources specifies compute resources for the iron-proxy container.
+	// +optional
+	Resources corev1.ResourceRequirements `json:"resources,omitempty"`
+	// AllowedHosts is the egress allowlist. Requests to any host not in this
+	// list are rejected with a 403. Hosts injected via Inject are always
+	// allowed and need not be repeated here.
+	// +optional
+	AllowedHosts []string `json:"allowedHosts,omitempty"`
+	// Inject configures per-host credential injection. Each rule reads a real
+	// secret from a Kubernetes Secret (via ValueFrom) into the sidecar's own
+	// environment and injects it as a header on requests to the matching host.
+	// The agent sends no credential of its own.
+	// +optional
+	Inject []EgressInject `json:"inject,omitempty"`
+}
+
+// EgressInject configures credential injection for a single destination host.
+type EgressInject struct {
+	// Host is the destination host the credential is injected for
+	// (e.g. "api.example.com"). Wildcards (e.g. "*.example.com") follow
+	// iron-proxy's allowlist matching.
+	// +kubebuilder:validation:Required
+	Host string `json:"host"`
+	// Header is the request header the credential is injected into.
+	// Defaults to "Authorization".
+	// +optional
+	Header string `json:"header,omitempty"`
+	// Formatter is the Go template applied to the credential before it is
+	// written to the header. The secret value is available as {{ .Value }}.
+	// Defaults to "Bearer {{ .Value }}".
+	// +optional
+	Formatter string `json:"formatter,omitempty"`
+	// ValueFrom sources the real credential (e.g. a secretKeyRef into the
+	// user's existing Secret). The operator derives a deterministic env var
+	// name for the sidecar and wires this source to it.
+	// +kubebuilder:validation:Required
+	ValueFrom corev1.EnvVarSource `json:"valueFrom"`
+}
+
+// EgressImageSpec specifies the iron-proxy container image repository and tag.
+type EgressImageSpec struct {
+	// repository is the image repository. Defaults to "docker.io/ironsh/iron-proxy".
+	// +optional
+	Repository string `json:"repository,omitempty"`
+	// tag is the image tag. Defaults to a pinned iron-proxy version.
+	// +optional
+	Tag string `json:"tag,omitempty"`
+}
+
+// IsEnabled reports whether the iron-proxy egress sidecar should be created.
+func (e *Egress) IsEnabled() bool {
+	return e != nil && e.Enabled != nil && *e.Enabled
+}
+
+// GetImage returns the fully qualified iron-proxy image reference.
+func (e *Egress) GetImage() string {
+	repo := defaultEgressImageRepository
+	tag := defaultEgressImageTag
+	if e != nil {
+		if e.Image.Repository != "" {
+			repo = e.Image.Repository
+		}
+		if e.Image.Tag != "" {
+			tag = e.Image.Tag
+		}
+	}
+	return repo + ":" + tag
+}
+
+// GetResources returns the iron-proxy container resource requirements.
+func (e *Egress) GetResources() corev1.ResourceRequirements {
+	if e != nil {
+		return e.Resources
+	}
+	return corev1.ResourceRequirements{}
+}
+
+// GetAllowedHosts returns the configured egress allowlist.
+func (e *Egress) GetAllowedHosts() []string {
+	if e == nil {
+		return nil
+	}
+	return e.AllowedHosts
+}
+
+// GetInject returns the configured credential-injection rules.
+func (e *Egress) GetInject() []EgressInject {
+	if e == nil {
+		return nil
+	}
+	return e.Inject
+}
+
+// GetHeader returns the header to inject the credential into, defaulting to
+// "Authorization".
+func (i *EgressInject) GetHeader() string {
+	if i == nil || i.Header == "" {
+		return DefaultEgressHeader
+	}
+	return i.Header
+}
+
+// GetFormatter returns the credential formatter template, defaulting to
+// "Bearer {{ .Value }}".
+func (i *EgressInject) GetFormatter() string {
+	if i == nil || i.Formatter == "" {
+		return DefaultEgressFormatter
+	}
+	return i.Formatter
+}
+
 // HermesAgentSpec defines the desired state of HermesAgent
 type HermesAgentSpec struct {
 	// suspend pauses the agent by scaling its StatefulSet to 0 replicas.
@@ -1474,6 +1620,10 @@ type HermesAgentSpec struct {
 	// Camofox configures an optional Camofox sidecar used by the browser automation tool.
 	// +optional
 	Camofox *Camofox `json:"camofox,omitempty"`
+
+	// Egress configures an optional iron-proxy egress credential-injection sidecar.
+	// +optional
+	Egress *Egress `json:"egress,omitempty"`
 }
 
 // ManagedResources lists the Kubernetes resources currently owned by this HermesAgent.
@@ -1510,6 +1660,12 @@ type ManagedResources struct {
 	// networkPolicy is the name of the managed NetworkPolicy.
 	// +optional
 	NetworkPolicy string `json:"networkPolicy,omitempty"`
+	// egressCASecret is the name of the managed iron-proxy CA Secret.
+	// +optional
+	EgressCASecret string `json:"egressCASecret,omitempty"`
+	// egressConfigMap is the name of the managed iron-proxy configuration ConfigMap.
+	// +optional
+	EgressConfigMap string `json:"egressConfigMap,omitempty"`
 	// statefulSet is the name of the managed StatefulSet.
 	// +optional
 	StatefulSet string `json:"statefulSet,omitempty"`
@@ -1673,6 +1829,29 @@ func (h *HermesAgent) GetCamofox() *Camofox {
 // GetCamofoxName returns the name used for the Camofox PersistentVolumeClaim.
 func (h *HermesAgent) GetCamofoxName() string {
 	return h.Name + "-camofox"
+}
+
+// GetEgress returns the iron-proxy egress sidecar configuration, if any.
+func (h *HermesAgent) GetEgress() *Egress {
+	return h.Spec.Egress
+}
+
+// GetEgressName returns the base name shared by operator-managed egress
+// objects (e.g. the iron-proxy sidecar container).
+func (h *HermesAgent) GetEgressName() string {
+	return h.Name + "-egress"
+}
+
+// GetEgressCASecretName returns the name of the Secret holding the iron-proxy
+// MITM CA certificate and key.
+func (h *HermesAgent) GetEgressCASecretName() string {
+	return h.Name + "-egress-ca"
+}
+
+// GetEgressConfigName returns the name of the ConfigMap holding the iron-proxy
+// proxy.yaml configuration.
+func (h *HermesAgent) GetEgressConfigName() string {
+	return h.Name + "-egress-config"
 }
 
 // +kubebuilder:object:root=true
