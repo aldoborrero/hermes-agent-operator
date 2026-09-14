@@ -1116,8 +1116,13 @@ func buildEgressContainer(ha *agentsv1alpha1.HermesAgent, sts *appsv1.StatefulSe
 			corev1.EnvVar{Name: "HTTPS_PROXY", Value: proxyURL},
 			corev1.EnvVar{Name: "HTTP_PROXY", Value: proxyURL},
 			// Cluster-internal traffic (in-pod sidecars, MCP servers, DB, the
-			// kube API) must bypass the proxy.
-			corev1.EnvVar{Name: "NO_PROXY", Value: "localhost,127.0.0.1,.svc,.cluster.local"},
+			// kube API) must bypass the proxy. `.svc`/`.cluster.local` cover DNS
+			// names but NOT the API server's ClusterIP, which the in-cluster client
+			// (e.g. the kubernetes terminal backend) dials by IP via
+			// KUBERNETES_SERVICE_HOST. On RKE2/k3s that is the first ServiceCIDR
+			// address, 10.43.0.1; without it the backend's pod-create call is
+			// tunneled through iron-proxy and rejected 403.
+			corev1.EnvVar{Name: "NO_PROXY", Value: "localhost,127.0.0.1,.svc,.cluster.local,10.43.0.1"},
 			// Trust iron-proxy's MITM CA across the common client stacks.
 			corev1.EnvVar{Name: "SSL_CERT_FILE", Value: agentCAPath},
 			corev1.EnvVar{Name: "REQUESTS_CA_BUNDLE", Value: agentCAPath},
