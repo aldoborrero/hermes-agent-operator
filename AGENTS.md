@@ -14,6 +14,11 @@ config/rbac/role.yaml          Generated RBAC (DO NOT EDIT)
 config/samples/*               Example CRs (edit these)
 Makefile                       Build/test/deploy commands
 PROJECT                        Kubebuilder metadata Auto-generated (DO NOT EDIT)
+flake.nix                      Nix inputs; outputs come from nix/ (blueprint)
+nix/devshell.nix               Dev shell (`nix develop` / direnv)
+nix/formatter.nix              treefmt config behind `nix fmt`
+nix/packages/*/                Nix build of the manager binary
+justfile                       Facade over the Makefile and the flake
 ```
 
 **Multi-group layout** (for projects with multiple API groups):
@@ -69,6 +74,15 @@ make generate   # Regenerate DeepCopy methods
 make lint-fix   # Auto-fix code style
 make test       # Run unit tests
 ```
+
+**After editing any file when the flake is in use:**
+```
+nix fmt         # Format nix, go, yaml, json, toml, shell, justfile
+nix flake check # Build the package and enforce formatting
+```
+
+Nix evaluation only sees **tracked** files: `git add` a new file before running
+any `nix` command, or the flake will not know it exists.
 
 ## CLI Commands Cheat Sheet
 
