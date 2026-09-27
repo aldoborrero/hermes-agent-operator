@@ -90,7 +90,9 @@ func (u *HermesAgentUseCase) reconcileEgressCA(ctx context.Context, ha *agentsv1
 		if err := validateEgressCASecret(refName, userSecret.Data); err != nil {
 			return ctrl.Result{RequeueAfter: 30 * time.Second}, err
 		}
-		if existing != nil {
+		// Drop a previously operator-managed CA — but never the referenced Secret
+		// itself, in case the user named it the same as the managed one.
+		if existing != nil && refName != ha.GetEgressCASecretName() {
 			if err := u.kube.DeleteSecret(ctx, DeleteSecretParam{NamespacedName: secretNsName}); err != nil {
 				return ctrl.Result{RequeueAfter: 30 * time.Second}, err
 			}
