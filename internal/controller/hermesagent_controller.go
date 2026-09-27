@@ -81,18 +81,15 @@ func (r *HermesAgentReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		Owns(&networkingv1.Ingress{}).
 		Owns(&networkingv1.NetworkPolicy{}).
 		Owns(&corev1.Secret{}).
-		// A user-supplied egress CA (spec.egress.ca.secretRef) is not owned by the
-		// operator, so Owns() would miss its rotation. Watch Secrets and re-reconcile
-		// the referencing HermesAgent so the CA hash (and thus a rolling restart)
-		// tracks the new CA — otherwise a rotated MITM CA never takes effect.
+		// A user-supplied egress CA (spec.egress.ca.secretRef) is not Owned, so
+		// watch Secrets to catch its rotation and re-reconcile the referencing agent.
 		Watches(&corev1.Secret{}, handler.EnqueueRequestsFromMapFunc(r.hermesAgentsForCASecret)).
 		Named("hermesagent").
 		Complete(r)
 }
 
-// hermesAgentsForCASecret maps a Secret to the HermesAgents in its namespace
-// that reference it as their egress CA (spec.egress.ca.secretRef), so a change
-// to a user-supplied CA Secret triggers a reconcile.
+// hermesAgentsForCASecret enqueues HermesAgents in the Secret's namespace that
+// reference it as their egress CA (spec.egress.ca.secretRef).
 func (r *HermesAgentReconciler) hermesAgentsForCASecret(ctx context.Context, obj client.Object) []reconcile.Request {
 	var list agentsv1alpha1.HermesAgentList
 	if err := r.List(ctx, &list, client.InNamespace(obj.GetNamespace())); err != nil {

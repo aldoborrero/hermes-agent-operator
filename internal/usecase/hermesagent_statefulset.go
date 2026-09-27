@@ -58,12 +58,9 @@ func (u *HermesAgentUseCase) reconcileStatefulSet(ctx context.Context, ha *agent
 
 	desired := buildStatefulSet(ha)
 
-	// Fold the egress CA certificate into the pod template so a rotated CA rolls
-	// the pod. buildStatefulSet is pure (CR only) and cannot see Secret contents,
-	// so a user-supplied CA (spec.egress.ca.secretRef) rotated by cert-manager
-	// would otherwise never restart the pod — leaving the agent trusting the old
-	// CA while iron-proxy signs with the new one. The single-pod rolling update
-	// brings both containers onto the new CA together.
+	// Fold the CA cert into the pod template so a rotated CA rolls the pod
+	// (buildStatefulSet is pure and can't read Secret contents). The single-pod
+	// rolling update moves the agent trust and iron-proxy signing CA together.
 	if ha.GetEgress().IsEnabled() {
 		caHash, err := u.egressCACertHash(ctx, ha)
 		if err != nil {
@@ -207,10 +204,8 @@ func hermesAgentReason(pod *corev1.Pod) string {
 	return pod.Status.Reason
 }
 
-// egressCACertHash returns a short hash of the egress CA certificate the sidecar
-// will mount, or "" when the Secret is not present yet (reconcileEgressCA runs
-// first and requeues until it is). Stamped onto the pod template so CA rotation
-// triggers a rolling restart.
+// egressCACertHash hashes the egress CA cert (or "" if the Secret isn't present
+// yet) to stamp on the pod template so CA rotation triggers a rolling restart.
 func (u *HermesAgentUseCase) egressCACertHash(ctx context.Context, ha *agentsv1alpha1.HermesAgent) (string, error) {
 	secretName, certKey, _ := ha.GetEgressCASource()
 	secret, err := u.kube.GetSecret(ctx, GetSecretParam{
@@ -1100,10 +1095,8 @@ func buildEgressContainer(ha *agentsv1alpha1.HermesAgent, sts *appsv1.StatefulSe
 	)
 	agentCAPath := agentCADir + "/" + egressCACertKey
 
-	// The CA may be operator-managed (ca.crt/ca.key) or user-supplied via
-	// spec.egress.ca.secretRef (tls.crt/tls.key). The mounted file names stay
-	// ca.crt/ca.key regardless (proxy.yaml + agent trust paths are constant); only
-	// the source Secret and its data keys (the SubPath) vary.
+	// Mounted file names stay ca.crt/ca.key (constant proxy.yaml + trust paths);
+	// only the source Secret and its data keys (the SubPath) vary.
 	caSecretName, caCertKey, caKeyKey := ha.GetEgressCASource()
 
 	proxyURL := fmt.Sprintf("http://localhost:%d", agentsv1alpha1.DefaultEgressTunnelPort)

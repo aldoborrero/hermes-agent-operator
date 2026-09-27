@@ -231,8 +231,7 @@ func TestBuildEgressContainer(t *testing.T) {
 	})
 }
 
-// userCASecret is a sample name for a user-supplied (e.g. cert-manager) egress
-// CA Secret used across the CA-source tests.
+// userCASecret is a sample user-supplied (e.g. cert-manager) egress CA Secret.
 const userCASecret = "cm-egress-ca"
 
 func TestGetEgressCASource(t *testing.T) {

@@ -76,9 +76,8 @@ func (u *HermesAgentUseCase) reconcileEgressCA(ctx context.Context, ha *agentsv1
 		return ctrl.Result{}, nil
 	}
 
-	// User-supplied CA (spec.egress.ca.secretRef): the operator does not manage a
-	// CA of its own. Validate the referenced Secret carries a cert + key, drop any
-	// previously operator-managed CA, and record that none is operator-owned.
+	// User-supplied CA: validate the referenced Secret, drop any previously
+	// operator-managed CA, and record that none is operator-owned.
 	if refName := ha.GetEgress().GetCASecretRefName(); refName != "" {
 		userNsName := types.NamespacedName{Name: refName, Namespace: ha.Namespace}
 		userSecret, err := u.kube.GetSecret(ctx, GetSecretParam{NamespacedName: userNsName})
@@ -124,11 +123,9 @@ func (u *HermesAgentUseCase) reconcileEgressCA(ctx context.Context, ha *agentsv1
 	return ctrl.Result{}, nil
 }
 
-// validateEgressCASecret checks that a user-supplied CA Secret carries a
-// certificate and private key under the standard TLS keys and that the
-// certificate is actually a CA that can sign leaf certs — iron-proxy mints per
-// host leaf certs on the fly, so a non-CA cert (e.g. a plain server Certificate)
-// would pass a key-presence check but break the MITM at runtime.
+// validateEgressCASecret checks the user-supplied Secret has a TLS cert + key
+// and that the cert is a CA — iron-proxy signs leaf certs, so a non-CA cert
+// would pass a presence check but break the MITM at runtime.
 func validateEgressCASecret(refName string, data map[string][]byte) error {
 	certPEM := data[agentsv1alpha1.EgressCATLSCertKey]
 	if len(certPEM) == 0 {

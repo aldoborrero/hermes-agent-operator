@@ -1443,10 +1443,8 @@ const DefaultEgressHeader = "Authorization"
 // credential when an EgressInject rule omits one.
 const DefaultEgressFormatter = "Bearer {{ .Value }}"
 
-// Egress CA Secret data keys. The operator-managed self-signed CA stores its
-// certificate and key under the EgressCAManaged* keys; a user-supplied CA
-// (EgressCA.SecretRef, e.g. a cert-manager Certificate Secret) uses the
-// standard kubernetes.io/tls keys.
+// Egress CA Secret data keys: the managed CA uses ca.crt/ca.key; a user-supplied
+// CA (EgressCA.SecretRef, e.g. cert-manager) uses the standard TLS keys.
 const (
 	EgressCAManagedCertKey = "ca.crt"
 	EgressCAManagedKeyKey  = "ca.key"
@@ -1481,26 +1479,19 @@ type Egress struct {
 	// The agent sends no credential of its own.
 	// +optional
 	Inject []EgressInject `json:"inject,omitempty"`
-	// CA configures the MITM certificate authority iron-proxy uses to sign the
-	// leaf certs it presents to the agent. When omitted, the operator generates
-	// a self-signed CA and preserves it across reconciles. Set CA.SecretRef to
-	// supply your own CA instead — the operator then does not create, own, or
-	// rotate the CA.
+	// CA selects the iron-proxy MITM CA. Omitted: the operator generates and
+	// preserves a self-signed CA. Set CA.SecretRef to bring your own.
 	// +optional
 	CA *EgressCA `json:"ca,omitempty"`
 }
 
 // EgressCA selects the source of the iron-proxy MITM CA.
 type EgressCA struct {
-	// SecretRef references an existing kubernetes.io/tls Secret in the
-	// HermesAgent's namespace holding the CA certificate and private key under
-	// the standard "tls.crt"/"tls.key" keys — the shape a cert-manager
-	// Certificate (with isCA: true) produces. When set, the operator uses this
-	// CA verbatim: it does not create, own, or delete the Secret. The operator
-	// watches the Secret and rolls the pod when it changes, so a rotation takes
-	// effect (the agent trust bundle and iron-proxy signing CA move together);
-	// the certificate lifecycle itself is owned by whatever manages the Secret.
-	// Omit to use the operator-managed self-signed CA.
+	// SecretRef points at an existing kubernetes.io/tls Secret in the agent's
+	// namespace (keys tls.crt/tls.key) holding a CA cert + key — the shape a
+	// cert-manager Certificate with isCA: true produces. The operator uses it
+	// verbatim (never creates, owns, or deletes it) and rolls the pod when it
+	// changes so rotation takes effect. Omit for the operator-managed CA.
 	// +optional
 	SecretRef *EgressCASecretRef `json:"secretRef,omitempty"`
 }
@@ -1898,9 +1889,8 @@ func (h *HermesAgent) GetEgressName() string {
 	return h.Name + "-egress"
 }
 
-// GetEgressCASecretName returns the name of the operator-managed Secret holding
-// the self-signed iron-proxy MITM CA certificate and key. It is the CA source
-// only when the user has not supplied one via spec.egress.ca.secretRef.
+// GetEgressCASecretName returns the operator-managed self-signed CA Secret name
+// (the CA source unless the user supplies one via spec.egress.ca.secretRef).
 func (h *HermesAgent) GetEgressCASecretName() string {
 	return h.Name + "-egress-ca"
 }
