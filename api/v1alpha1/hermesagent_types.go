@@ -1496,9 +1496,11 @@ type EgressCA struct {
 	// HermesAgent's namespace holding the CA certificate and private key under
 	// the standard "tls.crt"/"tls.key" keys — the shape a cert-manager
 	// Certificate (with isCA: true) produces. When set, the operator uses this
-	// CA verbatim: it does not create, own, or delete the Secret, and rotation
-	// is left to whatever manages that Secret. Omit to use the operator-managed
-	// self-signed CA.
+	// CA verbatim: it does not create, own, or delete the Secret. The operator
+	// watches the Secret and rolls the pod when it changes, so a rotation takes
+	// effect (the agent trust bundle and iron-proxy signing CA move together);
+	// the certificate lifecycle itself is owned by whatever manages the Secret.
+	// Omit to use the operator-managed self-signed CA.
 	// +optional
 	SecretRef *EgressCASecretRef `json:"secretRef,omitempty"`
 }
@@ -1507,6 +1509,7 @@ type EgressCA struct {
 type EgressCASecretRef struct {
 	// Name of the Secret in the HermesAgent's namespace.
 	// +kubebuilder:validation:Required
+	// +kubebuilder:validation:MinLength=1
 	Name string `json:"name"`
 }
 

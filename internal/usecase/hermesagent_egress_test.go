@@ -1,14 +1,79 @@
 package usecase
 
 import (
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
+	"crypto/x509"
+	"crypto/x509/pkix"
+	"encoding/pem"
+	"math/big"
 	"strings"
 	"testing"
+	"time"
 
 	agentsv1alpha1 "hermeum/hermes-agent-operator/api/v1alpha1"
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 )
+
+// certPEM generates a self-signed certificate PEM for tests. isCA controls the
+// CA basic constraint and, when true, the certSign key usage.
+func certPEM(t *testing.T, isCA bool) []byte {
+	t.Helper()
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tmpl := &x509.Certificate{
+		SerialNumber:          big.NewInt(1),
+		Subject:               pkix.Name{CommonName: "test"},
+		NotBefore:             time.Now().Add(-time.Hour),
+		NotAfter:              time.Now().Add(time.Hour),
+		IsCA:                  isCA,
+		BasicConstraintsValid: true,
+	}
+	if isCA {
+		tmpl.KeyUsage = x509.KeyUsageCertSign | x509.KeyUsageCRLSign
+	} else {
+		tmpl.KeyUsage = x509.KeyUsageDigitalSignature
+	}
+	der, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, &key.PublicKey, key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der})
+}
+
+func TestValidateEgressCASecret(t *testing.T) {
+	caCert := certPEM(t, true)
+	leafCert := certPEM(t, false)
+	key := []byte("-----BEGIN PRIVATE KEY-----\nx\n-----END PRIVATE KEY-----")
+
+	cases := []struct {
+		name    string
+		data    map[string][]byte
+		wantErr bool
+	}{
+		{"valid CA", map[string][]byte{"tls.crt": caCert, "tls.key": key}, false},
+		{"missing cert", map[string][]byte{"tls.key": key}, true},
+		{"missing key", map[string][]byte{"tls.crt": caCert}, true},
+		{"cert not PEM", map[string][]byte{"tls.crt": []byte("not a pem"), "tls.key": key}, true},
+		{"cert is not a CA", map[string][]byte{"tls.crt": leafCert, "tls.key": key}, true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			err := validateEgressCASecret("my-ca", tc.data)
+			if tc.wantErr && err == nil {
+				t.Error("expected an error, got nil")
+			}
+			if !tc.wantErr && err != nil {
+				t.Errorf("expected no error, got %v", err)
+			}
+		})
+	}
+}
 
 func enabledEgressHA() *agentsv1alpha1.HermesAgent {
 	ha := minimalHA()
