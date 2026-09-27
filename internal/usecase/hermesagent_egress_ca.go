@@ -76,6 +76,34 @@ func (u *HermesAgentUseCase) reconcileEgressCA(ctx context.Context, ha *agentsv1
 		return ctrl.Result{}, nil
 	}
 
+	// User-supplied CA (spec.egress.ca.secretRef): the operator does not manage a
+	// CA of its own. Validate the referenced Secret carries a cert + key, drop any
+	// previously operator-managed CA, and record that none is operator-owned.
+	if refName := ha.GetEgress().GetCASecretRefName(); refName != "" {
+		userNsName := types.NamespacedName{Name: refName, Namespace: ha.Namespace}
+		userSecret, err := u.kube.GetSecret(ctx, GetSecretParam{NamespacedName: userNsName})
+		if err != nil {
+			return ctrl.Result{RequeueAfter: 30 * time.Second}, err
+		}
+		if userSecret == nil {
+			return ctrl.Result{RequeueAfter: 30 * time.Second}, fmt.Errorf("egress CA Secret %q not found", refName)
+		}
+		if err := validateEgressCASecret(refName, userSecret.Data); err != nil {
+			return ctrl.Result{RequeueAfter: 30 * time.Second}, err
+		}
+		if existing != nil {
+			if err := u.kube.DeleteSecret(ctx, DeleteSecretParam{NamespacedName: secretNsName}); err != nil {
+				return ctrl.Result{RequeueAfter: 30 * time.Second}, err
+			}
+			u.tel.Debug(ctx, "operator-managed Egress CA Secret deleted (switched to user-supplied CA)")
+		}
+		ha.Status.ManagedResources.EgressCASecret = ""
+		if err := u.kube.UpdateHermesAgentStatus(ctx, UpdateHermesAgentStatusParam{HermesAgent: ha}); err != nil {
+			return ctrl.Result{RequeueAfter: 30 * time.Second}, err
+		}
+		return ctrl.Result{}, nil
+	}
+
 	// Never regenerate — preserve the CA across reconciles.
 	if existing != nil {
 		return ctrl.Result{}, nil
@@ -94,6 +122,38 @@ func (u *HermesAgentUseCase) reconcileEgressCA(ctx context.Context, ha *agentsv1
 		return ctrl.Result{RequeueAfter: 30 * time.Second}, err
 	}
 	return ctrl.Result{}, nil
+}
+
+// validateEgressCASecret checks that a user-supplied CA Secret carries a
+// certificate and private key under the standard TLS keys and that the
+// certificate is actually a CA that can sign leaf certs — iron-proxy mints per
+// host leaf certs on the fly, so a non-CA cert (e.g. a plain server Certificate)
+// would pass a key-presence check but break the MITM at runtime.
+func validateEgressCASecret(refName string, data map[string][]byte) error {
+	certPEM := data[agentsv1alpha1.EgressCATLSCertKey]
+	if len(certPEM) == 0 {
+		return fmt.Errorf("egress CA Secret %q missing key %q", refName, agentsv1alpha1.EgressCATLSCertKey)
+	}
+	if len(data[agentsv1alpha1.EgressCATLSKeyKey]) == 0 {
+		return fmt.Errorf("egress CA Secret %q missing key %q", refName, agentsv1alpha1.EgressCATLSKeyKey)
+	}
+
+	block, _ := pem.Decode(certPEM)
+	if block == nil {
+		return fmt.Errorf("egress CA Secret %q key %q is not PEM-encoded", refName, agentsv1alpha1.EgressCATLSCertKey)
+	}
+	cert, err := x509.ParseCertificate(block.Bytes)
+	if err != nil {
+		return fmt.Errorf("egress CA Secret %q: parsing certificate: %w", refName, err)
+	}
+	if !cert.IsCA {
+		return fmt.Errorf("egress CA Secret %q certificate is not a CA (isCA=false); iron-proxy needs a CA to sign leaf certs — issue it with cert-manager isCA: true", refName)
+	}
+	// KeyUsage is optional in X.509; when set it must permit certificate signing.
+	if cert.KeyUsage != 0 && cert.KeyUsage&x509.KeyUsageCertSign == 0 {
+		return fmt.Errorf("egress CA Secret %q certificate lacks the certSign key usage", refName)
+	}
+	return nil
 }
 
 // buildEgressCASecret generates a self-signed CA (ECDSA P-256, ~10 year

@@ -331,6 +331,31 @@ spec:
                     items:
                       type: string
                     type: array
+                  ca:
+                    description: |-
+                      CA configures the MITM certificate authority iron-proxy uses to sign the
+                      leaf certs it presents to the agent. When omitted, the operator generates
+                      a self-signed CA and preserves it across reconciles. Set CA.SecretRef to
+                      supply your own CA instead — the operator then does not create, own, or
+                      rotate the CA.
+                    properties:
+                      secretRef:
+                        description: |-
+                          SecretRef references an existing kubernetes.io/tls Secret in the
+                          HermesAgent's namespace holding the CA certificate and private key under
+                          the standard "tls.crt"/"tls.key" keys — the shape a cert-manager
+                          Certificate (with isCA: true) produces. When set, the operator uses this
+                          CA verbatim: it does not create, own, or delete the Secret, and rotation
+                          is left to whatever manages that Secret. Omit to use the operator-managed
+                          self-signed CA.
+                        properties:
+                          name:
+                            description: Name of the Secret in the HermesAgent's namespace.
+                            type: string
+                        required:
+                        - name
+                        type: object
+                    type: object
                   enabled:
                     description: Enabled turns on the iron-proxy egress sidecar.
                     type: boolean

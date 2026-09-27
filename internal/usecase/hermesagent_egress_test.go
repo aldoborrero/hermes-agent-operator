@@ -6,6 +6,7 @@ import (
 
 	agentsv1alpha1 "hermeum/hermes-agent-operator/api/v1alpha1"
 
+	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 )
 
@@ -161,6 +162,114 @@ func TestBuildEgressContainer(t *testing.T) {
 		}
 		if hasEnvVar(c.Env, "HTTPS_PROXY") {
 			t.Error("did not expect HTTPS_PROXY when egress is disabled")
+		}
+	})
+}
+
+// userCASecret is a sample name for a user-supplied (e.g. cert-manager) egress
+// CA Secret used across the CA-source tests.
+const userCASecret = "cm-egress-ca"
+
+func TestGetEgressCASource(t *testing.T) {
+	t.Run("managed CA by default", func(t *testing.T) {
+		ha := enabledEgressHA()
+		name, cert, key := ha.GetEgressCASource()
+		if name != ha.GetEgressCASecretName() {
+			t.Errorf("expected managed CA secret %q, got %q", ha.GetEgressCASecretName(), name)
+		}
+		if cert != agentsv1alpha1.EgressCAManagedCertKey || key != agentsv1alpha1.EgressCAManagedKeyKey {
+			t.Errorf("expected managed keys ca.crt/ca.key, got %q/%q", cert, key)
+		}
+		if !ha.GetEgress().UsesManagedCA() {
+			t.Error("UsesManagedCA should be true without a secretRef")
+		}
+	})
+
+	t.Run("user-supplied CA via secretRef", func(t *testing.T) {
+		ha := enabledEgressHA()
+		ha.Spec.Egress.CA = &agentsv1alpha1.EgressCA{
+			SecretRef: &agentsv1alpha1.EgressCASecretRef{Name: userCASecret},
+		}
+		name, cert, key := ha.GetEgressCASource()
+		if name != userCASecret {
+			t.Errorf("expected user CA secret %q, got %q", userCASecret, name)
+		}
+		if cert != agentsv1alpha1.EgressCATLSCertKey || key != agentsv1alpha1.EgressCATLSKeyKey {
+			t.Errorf("expected TLS keys tls.crt/tls.key, got %q/%q", cert, key)
+		}
+		if ha.GetEgress().UsesManagedCA() {
+			t.Error("UsesManagedCA should be false when secretRef is set")
+		}
+	})
+}
+
+func TestBuildEgressStatefulSetCASource(t *testing.T) {
+	findVol := func(sts *appsv1.StatefulSet, name string) *corev1.Volume {
+		for i := range sts.Spec.Template.Spec.Volumes {
+			if sts.Spec.Template.Spec.Volumes[i].Name == name {
+				return &sts.Spec.Template.Spec.Volumes[i]
+			}
+		}
+		return nil
+	}
+	caSubPath := func(c *corev1.Container, mountKey string) string {
+		for _, m := range c.VolumeMounts {
+			if m.Name == "egress-ca" && strings.HasSuffix(m.MountPath, "/"+mountKey) {
+				return m.SubPath
+			}
+		}
+		return ""
+	}
+
+	t.Run("managed CA: operator secret + ca.crt/ca.key subpaths", func(t *testing.T) {
+		ha := enabledEgressHA()
+		sts := buildStatefulSet(ha)
+
+		v := findVol(sts, "egress-ca")
+		if v == nil || v.Secret == nil {
+			t.Fatal("expected egress-ca secret volume")
+		}
+		if v.Secret.SecretName != ha.GetEgressCASecretName() {
+			t.Errorf("expected managed CA secret %q, got %q", ha.GetEgressCASecretName(), v.Secret.SecretName)
+		}
+		proxy := findContainer(sts, "iron-proxy")
+		if got := caSubPath(proxy, agentsv1alpha1.EgressCAManagedCertKey); got != agentsv1alpha1.EgressCAManagedCertKey {
+			t.Errorf("expected ca.crt subpath, got %q", got)
+		}
+		if got := caSubPath(proxy, agentsv1alpha1.EgressCAManagedKeyKey); got != agentsv1alpha1.EgressCAManagedKeyKey {
+			t.Errorf("expected ca.key subpath, got %q", got)
+		}
+	})
+
+	t.Run("user CA: referenced secret + tls.crt/tls.key subpaths, constant mount names", func(t *testing.T) {
+		ha := enabledEgressHA()
+		ha.Spec.Egress.CA = &agentsv1alpha1.EgressCA{
+			SecretRef: &agentsv1alpha1.EgressCASecretRef{Name: userCASecret},
+		}
+		sts := buildStatefulSet(ha)
+
+		v := findVol(sts, "egress-ca")
+		if v == nil || v.Secret == nil || v.Secret.SecretName != userCASecret {
+			t.Fatalf("expected egress-ca volume from user secret %q, got %+v", userCASecret, v)
+		}
+		proxy := findContainer(sts, "iron-proxy")
+		// Mount file name stays ca.crt/ca.key; only the source SubPath changes.
+		if got := caSubPath(proxy, agentsv1alpha1.EgressCAManagedCertKey); got != agentsv1alpha1.EgressCATLSCertKey {
+			t.Errorf("expected tls.crt subpath mounted at ca.crt, got %q", got)
+		}
+		if got := caSubPath(proxy, agentsv1alpha1.EgressCAManagedKeyKey); got != agentsv1alpha1.EgressCATLSKeyKey {
+			t.Errorf("expected tls.key subpath mounted at ca.key, got %q", got)
+		}
+
+		// Agent-side: cert only, from the user secret, keyed tls.crt -> ca.crt.
+		av := findVol(sts, "egress-agent-ca")
+		if av == nil || av.Secret == nil || av.Secret.SecretName != userCASecret {
+			t.Fatalf("expected agent CA volume from user secret, got %+v", av)
+		}
+		if len(av.Secret.Items) != 1 ||
+			av.Secret.Items[0].Key != agentsv1alpha1.EgressCATLSCertKey ||
+			av.Secret.Items[0].Path != agentsv1alpha1.EgressCAManagedCertKey {
+			t.Errorf("expected agent CA item tls.crt->ca.crt, got %+v", av.Secret.Items)
 		}
 	})
 }

@@ -57,6 +57,26 @@ func (u *HermesAgentUseCase) reconcileStatefulSet(ctx context.Context, ha *agent
 	}
 
 	desired := buildStatefulSet(ha)
+
+	// Fold the egress CA certificate into the pod template so a rotated CA rolls
+	// the pod. buildStatefulSet is pure (CR only) and cannot see Secret contents,
+	// so a user-supplied CA (spec.egress.ca.secretRef) rotated by cert-manager
+	// would otherwise never restart the pod — leaving the agent trusting the old
+	// CA while iron-proxy signs with the new one. The single-pod rolling update
+	// brings both containers onto the new CA together.
+	if ha.GetEgress().IsEnabled() {
+		caHash, err := u.egressCACertHash(ctx, ha)
+		if err != nil {
+			return ctrl.Result{RequeueAfter: 30 * time.Second}, err
+		}
+		if caHash != "" {
+			if desired.Spec.Template.Annotations == nil {
+				desired.Spec.Template.Annotations = map[string]string{}
+			}
+			desired.Spec.Template.Annotations[domain+"/egress-ca-hash"] = caHash
+		}
+	}
+
 	hash := desiredSpecHash(desired)
 	if desired.Annotations == nil {
 		desired.Annotations = map[string]string{}
@@ -185,6 +205,25 @@ func hermesAgentReason(pod *corev1.Pod) string {
 	}
 
 	return pod.Status.Reason
+}
+
+// egressCACertHash returns a short hash of the egress CA certificate the sidecar
+// will mount, or "" when the Secret is not present yet (reconcileEgressCA runs
+// first and requeues until it is). Stamped onto the pod template so CA rotation
+// triggers a rolling restart.
+func (u *HermesAgentUseCase) egressCACertHash(ctx context.Context, ha *agentsv1alpha1.HermesAgent) (string, error) {
+	secretName, certKey, _ := ha.GetEgressCASource()
+	secret, err := u.kube.GetSecret(ctx, GetSecretParam{
+		NamespacedName: types.NamespacedName{Name: secretName, Namespace: ha.Namespace},
+	})
+	if err != nil {
+		return "", err
+	}
+	if secret == nil {
+		return "", nil
+	}
+	h := sha256.Sum256(secret.Data[certKey])
+	return fmt.Sprintf("%x", h[:])[:16], nil
 }
 
 func configMapDataHash(data map[string]string) string {
@@ -1061,6 +1100,12 @@ func buildEgressContainer(ha *agentsv1alpha1.HermesAgent, sts *appsv1.StatefulSe
 	)
 	agentCAPath := agentCADir + "/" + egressCACertKey
 
+	// The CA may be operator-managed (ca.crt/ca.key) or user-supplied via
+	// spec.egress.ca.secretRef (tls.crt/tls.key). The mounted file names stay
+	// ca.crt/ca.key regardless (proxy.yaml + agent trust paths are constant); only
+	// the source Secret and its data keys (the SubPath) vary.
+	caSecretName, caCertKey, caKeyKey := ha.GetEgressCASource()
+
 	proxyURL := fmt.Sprintf("http://localhost:%d", agentsv1alpha1.DefaultEgressTunnelPort)
 
 	// Wire the agent container: proxy env + CA trust env + CA mount.
@@ -1108,8 +1153,8 @@ func buildEgressContainer(ha *agentsv1alpha1.HermesAgent, sts *appsv1.StatefulSe
 		SecurityContext: buildEgressContainerSecurityContext(),
 		VolumeMounts: []corev1.VolumeMount{
 			{Name: egressConfigVolume, MountPath: egressConfigMount + "/" + egressProxyConfigKey, SubPath: egressProxyConfigKey, ReadOnly: true},
-			{Name: egressCAVolume, MountPath: egressConfigMount + "/" + egressCACertKey, SubPath: egressCACertKey, ReadOnly: true},
-			{Name: egressCAVolume, MountPath: egressConfigMount + "/" + egressCAKeyKey, SubPath: egressCAKeyKey, ReadOnly: true},
+			{Name: egressCAVolume, MountPath: egressConfigMount + "/" + egressCACertKey, SubPath: caCertKey, ReadOnly: true},
+			{Name: egressCAVolume, MountPath: egressConfigMount + "/" + egressCAKeyKey, SubPath: caKeyKey, ReadOnly: true},
 		},
 	})
 
@@ -1126,7 +1171,7 @@ func buildEgressContainer(ha *agentsv1alpha1.HermesAgent, sts *appsv1.StatefulSe
 		corev1.Volume{
 			Name: egressCAVolume,
 			VolumeSource: corev1.VolumeSource{
-				Secret: &corev1.SecretVolumeSource{SecretName: ha.GetEgressCASecretName()},
+				Secret: &corev1.SecretVolumeSource{SecretName: caSecretName},
 			},
 		},
 		corev1.Volume{
@@ -1134,8 +1179,8 @@ func buildEgressContainer(ha *agentsv1alpha1.HermesAgent, sts *appsv1.StatefulSe
 			Name: agentCAVolume,
 			VolumeSource: corev1.VolumeSource{
 				Secret: &corev1.SecretVolumeSource{
-					SecretName:  ha.GetEgressCASecretName(),
-					Items:       []corev1.KeyToPath{{Key: egressCACertKey, Path: egressCACertKey}},
+					SecretName:  caSecretName,
+					Items:       []corev1.KeyToPath{{Key: caCertKey, Path: egressCACertKey}},
 					DefaultMode: &defaultMode,
 				},
 			},

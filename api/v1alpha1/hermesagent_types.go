@@ -1443,6 +1443,17 @@ const DefaultEgressHeader = "Authorization"
 // credential when an EgressInject rule omits one.
 const DefaultEgressFormatter = "Bearer {{ .Value }}"
 
+// Egress CA Secret data keys. The operator-managed self-signed CA stores its
+// certificate and key under the EgressCAManaged* keys; a user-supplied CA
+// (EgressCA.SecretRef, e.g. a cert-manager Certificate Secret) uses the
+// standard kubernetes.io/tls keys.
+const (
+	EgressCAManagedCertKey = "ca.crt"
+	EgressCAManagedKeyKey  = "ca.key"
+	EgressCATLSCertKey     = "tls.crt"
+	EgressCATLSKeyKey      = "tls.key"
+)
+
 // Egress configures an outbound credential-injection proxy (iron-proxy) sidecar.
 // When enabled, the operator runs iron-proxy alongside the hermes-agent
 // container and points the agent's HTTPS_PROXY/HTTP_PROXY at it. iron-proxy
@@ -1470,6 +1481,33 @@ type Egress struct {
 	// The agent sends no credential of its own.
 	// +optional
 	Inject []EgressInject `json:"inject,omitempty"`
+	// CA configures the MITM certificate authority iron-proxy uses to sign the
+	// leaf certs it presents to the agent. When omitted, the operator generates
+	// a self-signed CA and preserves it across reconciles. Set CA.SecretRef to
+	// supply your own CA instead — the operator then does not create, own, or
+	// rotate the CA.
+	// +optional
+	CA *EgressCA `json:"ca,omitempty"`
+}
+
+// EgressCA selects the source of the iron-proxy MITM CA.
+type EgressCA struct {
+	// SecretRef references an existing kubernetes.io/tls Secret in the
+	// HermesAgent's namespace holding the CA certificate and private key under
+	// the standard "tls.crt"/"tls.key" keys — the shape a cert-manager
+	// Certificate (with isCA: true) produces. When set, the operator uses this
+	// CA verbatim: it does not create, own, or delete the Secret, and rotation
+	// is left to whatever manages that Secret. Omit to use the operator-managed
+	// self-signed CA.
+	// +optional
+	SecretRef *EgressCASecretRef `json:"secretRef,omitempty"`
+}
+
+// EgressCASecretRef names a Secret supplying the egress CA.
+type EgressCASecretRef struct {
+	// Name of the Secret in the HermesAgent's namespace.
+	// +kubebuilder:validation:Required
+	Name string `json:"name"`
 }
 
 // EgressInject configures credential injection for a single destination host.
@@ -1547,6 +1585,21 @@ func (e *Egress) GetInject() []EgressInject {
 		return nil
 	}
 	return e.Inject
+}
+
+// GetCASecretRefName returns the name of a user-supplied egress CA Secret, or
+// "" when the operator manages its own self-signed CA.
+func (e *Egress) GetCASecretRefName() string {
+	if e == nil || e.CA == nil || e.CA.SecretRef == nil {
+		return ""
+	}
+	return e.CA.SecretRef.Name
+}
+
+// UsesManagedCA reports whether the operator generates and owns the egress CA
+// (true) rather than consuming a user-supplied one via CA.SecretRef (false).
+func (e *Egress) UsesManagedCA() bool {
+	return e.GetCASecretRefName() == ""
 }
 
 // GetHeader returns the header to inject the credential into, defaulting to
@@ -1842,10 +1895,22 @@ func (h *HermesAgent) GetEgressName() string {
 	return h.Name + "-egress"
 }
 
-// GetEgressCASecretName returns the name of the Secret holding the iron-proxy
-// MITM CA certificate and key.
+// GetEgressCASecretName returns the name of the operator-managed Secret holding
+// the self-signed iron-proxy MITM CA certificate and key. It is the CA source
+// only when the user has not supplied one via spec.egress.ca.secretRef.
 func (h *HermesAgent) GetEgressCASecretName() string {
 	return h.Name + "-egress-ca"
+}
+
+// GetEgressCASource returns the Secret name and the certificate/key data keys
+// the iron-proxy sidecar mounts for its MITM CA. With a user-supplied CA
+// (spec.egress.ca.secretRef) it is that Secret and the standard TLS keys;
+// otherwise the operator-managed Secret and its ca.crt/ca.key.
+func (h *HermesAgent) GetEgressCASource() (secretName, certKey, keyKey string) {
+	if ref := h.GetEgress().GetCASecretRefName(); ref != "" {
+		return ref, EgressCATLSCertKey, EgressCATLSKeyKey
+	}
+	return h.GetEgressCASecretName(), EgressCAManagedCertKey, EgressCAManagedKeyKey
 }
 
 // GetEgressConfigName returns the name of the ConfigMap holding the iron-proxy
