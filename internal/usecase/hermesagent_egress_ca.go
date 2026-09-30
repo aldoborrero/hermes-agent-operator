@@ -43,11 +43,20 @@ const (
 	egressCAKeyKey  = "ca.key"
 )
 
-// reconcileEgressCA ensures the iron-proxy MITM CA Secret exists when egress is
-// enabled and is removed when it is disabled. The CA is generated once and
-// preserved across reconciles (like the Hermes API server key) so the agent's
-// trusted CA and the proxy's signing CA never drift apart, which would break
-// TLS for every existing connection.
+// reconcileEgressCA manages *only* the operator's own self-signed iron-proxy MITM
+// CA Secret. It never creates or deletes a Secret the user supplied through
+// spec.egress.ca.secretRef, even when that Secret is named exactly like the
+// managed one. Concretely:
+//
+//   - enabled, no secretRef: generate the managed CA once. It is preserved across
+//     reconciles (like the Hermes API server key) so the agent's trusted CA and the
+//     proxy's signing CA never drift apart, which would break TLS for every
+//     existing connection.
+//   - enabled with a secretRef: validate the referenced Secret and leave it alone.
+//     A previously operator-managed CA is deleted, unless its name collides with
+//     the reference.
+//   - disabled: delete the managed CA, again unless the name collides with a
+//     secretRef.
 func (u *HermesAgentUseCase) reconcileEgressCA(ctx context.Context, ha *agentsv1alpha1.HermesAgent) (result ctrl.Result, err error) {
 	defer func() {
 		if err != nil {
@@ -63,7 +72,10 @@ func (u *HermesAgentUseCase) reconcileEgressCA(ctx context.Context, ha *agentsv1
 	}
 
 	if !ha.GetEgress().IsEnabled() {
-		if existing != nil {
+		// Same managed-name collision guard as the secretRef path below: a Secret the
+		// user pointed us at is never ours to delete, disabled or not.
+		userOwned := ha.GetEgress().GetCASecretRefName() == ha.GetEgressCASecretName()
+		if existing != nil && !userOwned {
 			if err := u.kube.DeleteSecret(ctx, DeleteSecretParam{NamespacedName: secretNsName}); err != nil {
 				return ctrl.Result{RequeueAfter: 30 * time.Second}, err
 			}
