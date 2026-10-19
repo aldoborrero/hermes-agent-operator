@@ -1681,6 +1681,47 @@ func TestOperatorDotEnvUserDotEnvAlone(t *testing.T) {
 	}
 }
 
+func TestDotEnvEgressTokens(t *testing.T) {
+	// With egress on, every .env swaps real keys for proxy tokens: hermes-agent
+	// lets .env override the process env.
+	withDotEnv := func(ha *agentsv1alpha1.HermesAgent) *agentsv1alpha1.HermesAgent {
+		dotEnv := &agentsv1alpha1.HermesWorkspace{DotEnv: &agentsv1alpha1.HermesDotEnv{
+			SecretRef: &corev1.LocalObjectReference{Name: "my-env"},
+		}}
+		ha.Spec.Hermes = &agentsv1alpha1.Hermes{
+			Workspace: dotEnv,
+			Profiles:  map[string]agentsv1alpha1.HermesProfile{"work": {Workspace: dotEnv}},
+		}
+		return ha
+	}
+	const override = `if [ -f "/hermes-egress-tokens/$key" ]`
+
+	t.Run("enabled", func(t *testing.T) {
+		ha := withDotEnv(egressHA(nil))
+		sts := buildStatefulSet(ha, testConfigHash)
+		for _, name := range []string{consolidatedInitContainerName, "init-profile-work"} {
+			ic := findInitContainer(sts, name)
+			if ic == nil {
+				t.Fatalf("expected %s", name)
+			}
+			if !strings.Contains(ic.Args[0], override) {
+				t.Errorf("%s: expected the token override in the dotenv script:\n%s", name, ic.Args[0])
+			}
+			if !hasVolumeMount(ic.VolumeMounts, "hermes-egress-tokens") {
+				t.Errorf("%s: expected the egress tokens mounted", name)
+			}
+		}
+	})
+
+	t.Run("disabled", func(t *testing.T) {
+		sts := buildStatefulSet(withDotEnv(minimalHA()), testConfigHash)
+		ic := findInitContainer(sts, consolidatedInitContainerName)
+		if strings.Contains(ic.Args[0], override) || hasVolumeMount(ic.VolumeMounts, "hermes-egress-tokens") {
+			t.Error("expected no token override without egress")
+		}
+	})
+}
+
 func TestDotEnvPluralConfigMapRefs(t *testing.T) {
 	// Plural configMapRefs alone mounts N volumes in order.
 	ha := minimalHA()

@@ -245,6 +245,25 @@ func buildHermesContainer(ha *agentsv1alpha1.HermesAgent, sts *appsv1.StatefulSe
 	// ConfigMap keys use the format "profile.default.workspace.<path>" with "/" replaced by "--".
 	defaultSteps = append(defaultSteps, buildWorkspaceScript(hermesDefaultProfile))
 
+	// egress: with the proxy on, every .env gets proxy tokens in place of the
+	// real keys (see buildDotEnvScript), read from the egress Secret.
+	const (
+		egressTokensVolume = "hermes-egress-tokens"
+		egressTokensMount  = "/hermes-egress-tokens"
+	)
+	egressTokensDir := ""
+	var egressTokensMounts []corev1.VolumeMount
+	if ha.GetEgress().IsEnabled() {
+		egressTokensDir = egressTokensMount
+		egressTokensMounts = []corev1.VolumeMount{{Name: egressTokensVolume, MountPath: egressTokensMount, ReadOnly: true}}
+		volumes = append(volumes, corev1.Volume{
+			Name: egressTokensVolume,
+			VolumeSource: corev1.VolumeSource{
+				Secret: &corev1.SecretVolumeSource{SecretName: ha.GetEgressSecretName()},
+			},
+		})
+	}
+
 	// dotenv: write the default profile .env.
 	de := ha.GetHermes().GetWorkspace().GetDotEnv()
 	operatorItems := buildOperatorDotEnvItems(ha)
@@ -349,8 +368,8 @@ func buildHermesContainer(ha *agentsv1alpha1.HermesAgent, sts *appsv1.StatefulSe
 			}
 		}
 
-		defaultSteps = append(defaultSteps, buildDotEnvScript(hermesDefaultProfile, mountPaths...))
-		defaultMounts = mounts
+		defaultSteps = append(defaultSteps, buildDotEnvScript(hermesDefaultProfile, egressTokensDir, mountPaths...))
+		defaultMounts = append(mounts, egressTokensMounts...)
 	}
 
 	// python-packages: install desired packages into $HERMES_HOME/.python-packages.
@@ -492,7 +511,8 @@ func buildHermesContainer(ha *agentsv1alpha1.HermesAgent, sts *appsv1.StatefulSe
 				}
 			}
 
-			steps = append(steps, buildDotEnvScript(name, mountPaths...))
+			steps = append(steps, buildDotEnvScript(name, egressTokensDir, mountPaths...))
+			profileMounts = append(profileMounts, egressTokensMounts...)
 		}
 
 		steps = append(steps, buildPluginsScript(name, profile.Plugins))

@@ -334,16 +334,26 @@ printf '%%s' "$DESIRED" > "$MANIFEST"
 `, manifestContent, installCmd)
 }
 
-func buildDotEnvScript(profile string, mountPaths ...string) string {
+// buildDotEnvScript writes the profile's .env from the files in mountPaths,
+// one KEY=value line per file. When egressTokensDir is set, a key with a
+// proxy token there gets the token instead of its value: hermes-agent lets
+// .env override the process env, so a real key left in .env would both sit
+// on the agent's volume and win over the token the agent's env carries.
+func buildDotEnvScript(profile, egressTokensDir string, mountPaths ...string) string {
+	tokenOverride := ""
+	if egressTokensDir != "" {
+		tokenOverride = fmt.Sprintf(`    if [ -f "%[1]s/$key" ]; then value="$(cat "%[1]s/$key")"; fi
+`, egressTokensDir)
+	}
 	var body strings.Builder
 	for _, mp := range mountPaths {
 		fmt.Fprintf(&body, `  for f in "%s"/*; do
     [ -f "$f" ] || continue
     key="$(basename "$f")"
     value="$(cat "$f")"
-    printf '%%s=%%s\n' "$key" "$value"
+%s    printf '%%s=%%s\n' "$key" "$value"
   done
-`, mp)
+`, mp, tokenOverride)
 	}
 	return fmt.Sprintf(`set -eu
 {

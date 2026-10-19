@@ -105,7 +105,9 @@ type Egress struct {
 	// env var name (e.g. ANTHROPIC_API_KEY). Only the iron-proxy sidecar reads
 	// it. Every key naming a provider hermes-agent knows, and every
 	// config.extraSecrets entry, becomes a proxied credential: the agent gets a
-	// proxy token under that env var name instead of the key.
+	// proxy token under that env var name instead of the key, also where
+	// spec.hermes env, envFrom or workspace.dotEnv carry the same name. Keys
+	// not listed here reach the agent unchanged.
 	// +optional
 	Credentials *EgressCredentials `json:"credentials,omitempty"`
 	// CA selects the iron-proxy MITM CA. When omitted, the operator generates
@@ -119,9 +121,19 @@ type Egress struct {
 
 // EgressCredentials names the Secret holding the real provider API keys.
 type EgressCredentials struct {
-	// SecretRef names a Secret in the HermesAgent's namespace.
+	// SecretRef names a Secret in the HermesAgent's namespace. It must exist
+	// before the agent is reconciled.
 	// +kubebuilder:validation:Required
-	SecretRef corev1.LocalObjectReference `json:"secretRef"`
+	SecretRef EgressSecretRef `json:"secretRef"`
+}
+
+// EgressSecretRef names a Secret in the HermesAgent's namespace.
+type EgressSecretRef struct {
+	// Name of the Secret.
+	// +kubebuilder:validation:MinLength=1
+	// +kubebuilder:validation:MaxLength=253
+	// +kubebuilder:validation:Required
+	Name string `json:"name"`
 }
 
 // EgressCA selects the source of the iron-proxy MITM CA.
@@ -131,7 +143,7 @@ type EgressCA struct {
 	// cert-manager Certificate with isCA: true produces. The operator reads it
 	// but never creates, owns or deletes it, and rolls the pod when it changes.
 	// +optional
-	SecretRef *corev1.LocalObjectReference `json:"secretRef,omitempty"`
+	SecretRef *EgressSecretRef `json:"secretRef,omitempty"`
 }
 
 // EgressConfig mirrors hermes-agent's `proxy` config section.
@@ -147,10 +159,12 @@ type EgressConfig struct {
 	// against the resolved address whatever the allowlist says. Defaults to
 	// hermes-agent's list: loopback, link-local (cloud metadata), RFC1918, ULA,
 	// IPv4-mapped IPv6, CGNAT and benchmark ranges.
+	// +listType=set
 	// +optional
 	UpstreamDenyCIDRs []string `json:"upstreamDenyCidrs,omitempty"`
 	// ExtraAllowedHosts are allowed on top of the bundled provider hosts.
 	// Wildcards (*.example.com) are supported.
+	// +listType=set
 	// +optional
 	ExtraAllowedHosts []string `json:"extraAllowedHosts,omitempty"`
 	// ExtraSecrets are swapped on top of the bundled providers. An entry named
@@ -170,22 +184,27 @@ type EgressSecret struct {
 	Name string `json:"name"`
 	// Hosts are the upstream hosts the token is swapped on. They are allowed
 	// implicitly.
+	// +listType=set
 	// +kubebuilder:validation:MinItems=1
 	// +kubebuilder:validation:Required
 	Hosts []string `json:"hosts"`
-	// MatchHeaders are the request headers, as case-insensitive regexes,
-	// searched for the token. The query string is always searched too.
-	// Defaults to Authorization.
+	// MatchHeaders are the request headers searched for the token, by name
+	// (case-insensitive), or by regex when written as /pattern/. The query
+	// string is always searched too. Defaults to Authorization.
+	// +listType=set
 	// +optional
 	MatchHeaders []string `json:"matchHeaders,omitempty"`
 	// Aliases are extra env var names the agent gets the same token under.
 	// The real value may be stored under any of them in the credentials Secret.
+	// +listType=set
+	// +kubebuilder:validation:items:Pattern=`^[A-Za-z_][A-Za-z0-9_]*$`
 	// +optional
 	Aliases []string `json:"aliases,omitempty"`
 }
 
 // EgressCredential is a credential iron-proxy swaps: the EgressSecret it
 // derives from, plus the credentials Secret key holding its real value.
+// +kubebuilder:object:generate=false
 type EgressCredential struct {
 	EgressSecret
 	// SourceKey is the credentials Secret key holding the real value: Name, or
@@ -289,7 +308,7 @@ func (e *Egress) ResolveCredentials(keys []string) ([]EgressCredential, error) {
 		extra = e.Config.ExtraSecrets
 	}
 	sourceKey := func(s EgressSecret) string {
-		for _, k := range append([]string{s.Name}, s.Aliases...) {
+		for _, k := range s.EnvNames() {
 			if slices.Contains(keys, k) {
 				return k
 			}
@@ -307,6 +326,7 @@ func (e *Egress) ResolveCredentials(keys []string) ([]EgressCredential, error) {
 	}
 
 	var creds []EgressCredential
+	envNames := map[string]string{}
 	for _, s := range specs {
 		k := sourceKey(s)
 		if k == "" {
@@ -315,9 +335,24 @@ func (e *Egress) ResolveCredentials(keys []string) ([]EgressCredential, error) {
 			}
 			continue
 		}
-		creds = append(creds, EgressCredential{EgressSecret: s, SourceKey: k})
+		// Each env var name carries exactly one token; two credentials
+		// claiming it would leave the agent with only one of them.
+		for _, name := range s.EnvNames() {
+			if owner, taken := envNames[name]; taken {
+				return nil, fmt.Errorf("credentials %q and %q both use env var %q", owner, s.Name, name)
+			}
+			envNames[name] = s.Name
+		}
+		// Deep copy: specs share slices with the package-level provider table.
+		creds = append(creds, EgressCredential{EgressSecret: *s.DeepCopy(), SourceKey: k})
 	}
 	return creds, nil
+}
+
+// EnvNames returns the env var names the agent gets this credential's token
+// under: Name followed by Aliases.
+func (s *EgressSecret) EnvNames() []string {
+	return append([]string{s.Name}, s.Aliases...)
 }
 
 // GetMatchHeaders returns the headers searched for the token, defaulting to
@@ -370,4 +405,19 @@ func (h *HermesAgent) GetEgressSourceSecretNames() []string {
 		}
 	}
 	return names
+}
+
+// ValidateEgressSecretRefs rejects user-supplied Secrets named like a Secret
+// the operator manages for egress: the operator would overwrite the user's
+// Secret, and could hand its real keys to the agent as proxy tokens.
+func (h *HermesAgent) ValidateEgressSecretRefs() error {
+	e := h.GetEgress()
+	creds, ca := e.GetCredentialsSecretName(), e.GetCASecretRefName()
+	switch {
+	case creds != "" && (creds == h.GetEgressSecretName() || creds == h.GetEgressCASecretName()):
+		return fmt.Errorf("egress credentials Secret %q collides with a Secret the operator manages", creds)
+	case ca != "" && ca == h.GetEgressSecretName():
+		return fmt.Errorf("egress CA Secret %q collides with a Secret the operator manages", ca)
+	}
+	return nil
 }

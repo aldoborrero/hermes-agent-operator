@@ -73,11 +73,7 @@ func (u *HermesAgentUseCase) reconcileEgressSecret(ctx context.Context, ha *agen
 			}
 			u.tel.Debug(ctx, "Egress Secret deleted")
 		}
-		ha.Status.ManagedResources.EgressSecret = ""
-		if err := u.kube.UpdateHermesAgentStatus(ctx, UpdateHermesAgentStatusParam{HermesAgent: ha}); err != nil {
-			return ctrl.Result{RequeueAfter: 30 * time.Second}, err
-		}
-		return ctrl.Result{}, nil
+		return u.recordEgressSecret(ctx, ha, "")
 	}
 
 	creds, err := u.resolveEgressCredentials(ctx, ha)
@@ -90,23 +86,29 @@ func (u *HermesAgentUseCase) reconcileEgressSecret(ctx context.Context, ha *agen
 		return ctrl.Result{RequeueAfter: 30 * time.Second}, err
 	}
 
-	if existing != nil {
-		if maps.EqualFunc(existing.Data, desired.Data, bytes.Equal) {
-			return ctrl.Result{}, nil
+	switch {
+	case existing == nil:
+		if err := u.kube.CreateSecretOwnedByHermesAgent(ctx, CreateSecretOfHermesAgentParam{HermesAgent: ha, Secret: desired}); err != nil {
+			return ctrl.Result{RequeueAfter: 30 * time.Second}, err
 		}
+		u.tel.Debug(ctx, "Egress Secret created")
+	case !maps.EqualFunc(existing.Data, desired.Data, bytes.Equal):
 		existing.Data = desired.Data
 		if err := u.kube.UpdateSecretOwnedByHermesAgent(ctx, UpdateSecretOfHermesAgentParam{HermesAgent: ha, Secret: existing}); err != nil {
 			return ctrl.Result{RequeueAfter: 30 * time.Second}, err
 		}
 		u.tel.Debug(ctx, "Egress Secret updated")
+	}
+	return u.recordEgressSecret(ctx, ha, ha.GetEgressSecretName())
+}
+
+// recordEgressSecret records the managed egress Secret in the status, writing
+// it only on change: this loop runs for every agent, egress or not.
+func (u *HermesAgentUseCase) recordEgressSecret(ctx context.Context, ha *agentsv1alpha1.HermesAgent, name string) (ctrl.Result, error) {
+	if ha.Status.ManagedResources.EgressSecret == name {
 		return ctrl.Result{}, nil
 	}
-
-	if err := u.kube.CreateSecretOwnedByHermesAgent(ctx, CreateSecretOfHermesAgentParam{HermesAgent: ha, Secret: desired}); err != nil {
-		return ctrl.Result{RequeueAfter: 30 * time.Second}, err
-	}
-	u.tel.Debug(ctx, "Egress Secret created")
-	ha.Status.ManagedResources.EgressSecret = ha.GetEgressSecretName()
+	ha.Status.ManagedResources.EgressSecret = name
 	if err := u.kube.UpdateHermesAgentStatus(ctx, UpdateHermesAgentStatusParam{HermesAgent: ha}); err != nil {
 		return ctrl.Result{RequeueAfter: 30 * time.Second}, err
 	}
@@ -134,9 +136,13 @@ func buildEgressSecret(ha *agentsv1alpha1.HermesAgent, creds []agentsv1alpha1.Eg
 		return nil, err
 	}
 
+	// Every env var name of a credential, aliases included, gets its own key,
+	// so that the agent's env and its .env can look a token up by name.
 	data := map[string][]byte{agentsv1alpha1.EgressProxyConfigKey: []byte(proxyYAML)}
-	for name, token := range tokens {
-		data[name] = []byte(token)
+	for _, c := range creds {
+		for _, name := range c.EnvNames() {
+			data[name] = []byte(tokens[c.Name])
+		}
 	}
 	return &corev1.Secret{
 		ObjectMeta: metav1.ObjectMeta{

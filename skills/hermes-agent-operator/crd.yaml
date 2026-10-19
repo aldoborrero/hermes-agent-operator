@@ -335,16 +335,13 @@ spec:
                           but never creates, owns or deletes it, and rolls the pod when it changes.
                         properties:
                           name:
-                            default: ""
-                            description: |-
-                              Name of the referent.
-                              This field is effectively required, but due to backwards compatibility is
-                              allowed to be empty. Instances of this type with an empty value here are
-                              almost certainly wrong.
-                              More info: https://kubernetes.io/docs/concepts/overview/working-with-objects/names/#names
+                            description: Name of the Secret.
+                            maxLength: 253
+                            minLength: 1
                             type: string
+                        required:
+                        - name
                         type: object
-                        x-kubernetes-map-type: atomic
                     type: object
                   config:
                     description: Config mirrors hermes-agent's `proxy` config section.
@@ -356,6 +353,7 @@ spec:
                         items:
                           type: string
                         type: array
+                        x-kubernetes-list-type: set
                       extraSecrets:
                         description: |-
                           ExtraSecrets are swapped on top of the bundled providers. An entry named
@@ -369,8 +367,10 @@ spec:
                                 Aliases are extra env var names the agent gets the same token under.
                                 The real value may be stored under any of them in the credentials Secret.
                               items:
+                                pattern: ^[A-Za-z_][A-Za-z0-9_]*$
                                 type: string
                               type: array
+                              x-kubernetes-list-type: set
                             hosts:
                               description: |-
                                 Hosts are the upstream hosts the token is swapped on. They are allowed
@@ -379,14 +379,16 @@ spec:
                                 type: string
                               minItems: 1
                               type: array
+                              x-kubernetes-list-type: set
                             matchHeaders:
                               description: |-
-                                MatchHeaders are the request headers, as case-insensitive regexes,
-                                searched for the token. The query string is always searched too.
-                                Defaults to Authorization.
+                                MatchHeaders are the request headers searched for the token, by name
+                                (case-insensitive), or by regex when written as /pattern/. The query
+                                string is always searched too. Defaults to Authorization.
                               items:
                                 type: string
                               type: array
+                              x-kubernetes-list-type: set
                             name:
                               description: |-
                                 Name is the env var the agent reads the credential from, and the key
@@ -419,6 +421,7 @@ spec:
                         items:
                           type: string
                         type: array
+                        x-kubernetes-list-type: set
                     type: object
                   credentials:
                     description: |-
@@ -426,23 +429,23 @@ spec:
                       env var name (e.g. ANTHROPIC_API_KEY). Only the iron-proxy sidecar reads
                       it. Every key naming a provider hermes-agent knows, and every
                       config.extraSecrets entry, becomes a proxied credential: the agent gets a
-                      proxy token under that env var name instead of the key.
+                      proxy token under that env var name instead of the key, also where
+                      spec.hermes env, envFrom or workspace.dotEnv carry the same name. Keys
+                      not listed here reach the agent unchanged.
                     properties:
                       secretRef:
-                        description: SecretRef names a Secret in the HermesAgent's
-                          namespace.
+                        description: |-
+                          SecretRef names a Secret in the HermesAgent's namespace. It must exist
+                          before the agent is reconciled.
                         properties:
                           name:
-                            default: ""
-                            description: |-
-                              Name of the referent.
-                              This field is effectively required, but due to backwards compatibility is
-                              allowed to be empty. Instances of this type with an empty value here are
-                              almost certainly wrong.
-                              More info: https://kubernetes.io/docs/concepts/overview/working-with-objects/names/#names
+                            description: Name of the Secret.
+                            maxLength: 253
+                            minLength: 1
                             type: string
+                        required:
+                        - name
                         type: object
-                        x-kubernetes-map-type: atomic
                     required:
                     - secretRef
                     type: object

@@ -24,6 +24,9 @@ func configMapDataEqual(a, b *corev1.ConfigMap) bool {
 // referenced. It is shared by the egress Secret and StatefulSet reconcilers,
 // which must agree on the credentials.
 func (u *HermesAgentUseCase) resolveEgressCredentials(ctx context.Context, ha *agentsv1alpha1.HermesAgent) ([]agentsv1alpha1.EgressCredential, error) {
+	if err := ha.ValidateEgressSecretRefs(); err != nil {
+		return nil, err
+	}
 	eg := ha.GetEgress()
 	var keys []string
 	if name := eg.GetCredentialsSecretName(); name != "" {

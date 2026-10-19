@@ -74,11 +74,7 @@ func (u *HermesAgentUseCase) reconcileEgressCA(ctx context.Context, ha *agentsv1
 			}
 			u.tel.Debug(ctx, "Egress CA Secret deleted")
 		}
-		ha.Status.ManagedResources.EgressCASecret = ""
-		if err := u.kube.UpdateHermesAgentStatus(ctx, UpdateHermesAgentStatusParam{HermesAgent: ha}); err != nil {
-			return ctrl.Result{RequeueAfter: 30 * time.Second}, err
-		}
-		return ctrl.Result{}, nil
+		return u.recordEgressCASecret(ctx, ha, "")
 	}
 
 	// User-supplied CA: validate the referenced Secret, drop any previously
@@ -101,18 +97,14 @@ func (u *HermesAgentUseCase) reconcileEgressCA(ctx context.Context, ha *agentsv1
 			if err := u.kube.DeleteSecret(ctx, DeleteSecretParam{NamespacedName: secretNsName}); err != nil {
 				return ctrl.Result{RequeueAfter: 30 * time.Second}, err
 			}
-			u.tel.Debug(ctx, "operator-managed Egress CA Secret deleted (switched to user-supplied CA)")
+			u.tel.Debug(ctx, "Egress CA Secret deleted after switching to a user-supplied CA")
 		}
-		ha.Status.ManagedResources.EgressCASecret = ""
-		if err := u.kube.UpdateHermesAgentStatus(ctx, UpdateHermesAgentStatusParam{HermesAgent: ha}); err != nil {
-			return ctrl.Result{RequeueAfter: 30 * time.Second}, err
-		}
-		return ctrl.Result{}, nil
+		return u.recordEgressCASecret(ctx, ha, "")
 	}
 
-	// Never regenerate — preserve the CA across reconciles.
+	// Never regenerate: preserve the CA across reconciles.
 	if existing != nil {
-		return ctrl.Result{}, nil
+		return u.recordEgressCASecret(ctx, ha, ha.GetEgressCASecretName())
 	}
 
 	secret, err := buildEgressCASecret(ha)
@@ -123,7 +115,16 @@ func (u *HermesAgentUseCase) reconcileEgressCA(ctx context.Context, ha *agentsv1
 		return ctrl.Result{RequeueAfter: 30 * time.Second}, err
 	}
 	u.tel.Debug(ctx, "Egress CA Secret created")
-	ha.Status.ManagedResources.EgressCASecret = ha.GetEgressCASecretName()
+	return u.recordEgressCASecret(ctx, ha, ha.GetEgressCASecretName())
+}
+
+// recordEgressCASecret records the managed CA Secret in the status, writing
+// it only on change: this loop runs for every agent, egress or not.
+func (u *HermesAgentUseCase) recordEgressCASecret(ctx context.Context, ha *agentsv1alpha1.HermesAgent, name string) (ctrl.Result, error) {
+	if ha.Status.ManagedResources.EgressCASecret == name {
+		return ctrl.Result{}, nil
+	}
+	ha.Status.ManagedResources.EgressCASecret = name
 	if err := u.kube.UpdateHermesAgentStatus(ctx, UpdateHermesAgentStatusParam{HermesAgent: ha}); err != nil {
 		return ctrl.Result{RequeueAfter: 30 * time.Second}, err
 	}

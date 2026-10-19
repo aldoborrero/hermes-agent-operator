@@ -27,8 +27,9 @@ const (
 )
 
 // egressPodInputs reads what the egress wiring needs beyond the spec: the
-// resolved credentials, and a hash of the CA certificate and the egress Secret
-// so that rotating either restarts the pod, which reads both only at start.
+// resolved credentials, and a hash of everything the pod reads only at start
+// (the CA certificate, the egress Secret and the real keys) so that rotating
+// any of them restarts it.
 func (u *HermesAgentUseCase) egressPodInputs(ctx context.Context, ha *agentsv1alpha1.HermesAgent) ([]agentsv1alpha1.EgressCredential, string, error) {
 	creds, err := u.resolveEgressCredentials(ctx, ha)
 	if err != nil {
@@ -36,11 +37,25 @@ func (u *HermesAgentUseCase) egressPodInputs(ctx context.Context, ha *agentsv1al
 	}
 
 	caName, caCertKey, _ := ha.GetEgressCASource()
+	sourceKeys := make([]string, 0, len(creds))
+	for _, c := range creds {
+		sourceKeys = append(sourceKeys, c.SourceKey)
+	}
+
+	// The real keys only enter a truncated SHA-256 over every input, which
+	// does not disclose them.
 	h := sha256.New()
-	for _, src := range []struct{ name, onlyKey string }{
-		{caName, caCertKey},
-		{ha.GetEgressSecretName(), ""},
+	for _, src := range []struct {
+		name string
+		keys []string // nil hashes every key
+	}{
+		{name: caName, keys: []string{caCertKey}},
+		{name: ha.GetEgressSecretName()},
+		{name: ha.GetEgress().GetCredentialsSecretName(), keys: sourceKeys},
 	} {
+		if src.name == "" {
+			continue
+		}
 		secret, err := u.kube.GetSecret(ctx, GetSecretParam{NamespacedName: types.NamespacedName{Name: src.name, Namespace: ha.Namespace}})
 		if err != nil {
 			return nil, "", err
@@ -48,10 +63,12 @@ func (u *HermesAgentUseCase) egressPodInputs(ctx context.Context, ha *agentsv1al
 		if secret == nil {
 			continue
 		}
-		for _, k := range slices.Sorted(maps.Keys(secret.Data)) {
-			if src.onlyKey == "" || k == src.onlyKey {
-				_, _ = fmt.Fprintf(h, "%s\x00%s\x00%s\x00", src.name, k, secret.Data[k])
-			}
+		keys := src.keys
+		if keys == nil {
+			keys = slices.Sorted(maps.Keys(secret.Data))
+		}
+		for _, k := range keys {
+			_, _ = fmt.Fprintf(h, "%s\x00%s\x00%s\x00", src.name, k, secret.Data[k])
 		}
 	}
 	return creds, fmt.Sprintf("%x", h.Sum(nil))[:16], nil
@@ -118,12 +135,14 @@ func buildEgressContainer(ha *agentsv1alpha1.HermesAgent, sts *appsv1.StatefulSe
 			c.Env = append(c.Env, corev1.EnvVar{Name: kv[0], Value: kv[1]})
 		}
 		for _, cred := range creds {
-			token := &corev1.EnvVarSource{SecretKeyRef: &corev1.SecretKeySelector{
-				LocalObjectReference: corev1.LocalObjectReference{Name: ha.GetEgressSecretName()},
-				Key:                  cred.Name,
-			}}
-			for _, name := range append([]string{cred.Name}, cred.Aliases...) {
-				c.Env = append(c.Env, corev1.EnvVar{Name: name, ValueFrom: token})
+			for _, name := range cred.EnvNames() {
+				c.Env = append(c.Env, corev1.EnvVar{
+					Name: name,
+					ValueFrom: &corev1.EnvVarSource{SecretKeyRef: &corev1.SecretKeySelector{
+						LocalObjectReference: corev1.LocalObjectReference{Name: ha.GetEgressSecretName()},
+						Key:                  name,
+					}},
+				})
 			}
 		}
 		c.VolumeMounts = append(c.VolumeMounts, corev1.VolumeMount{
