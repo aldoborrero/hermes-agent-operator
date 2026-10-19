@@ -317,6 +317,207 @@ spec:
                         type: object
                     type: object
                 type: object
+              egress:
+                description: |-
+                  Egress configures an optional iron-proxy sidecar that keeps provider API
+                  keys out of the agent container and allowlists its outbound hosts.
+                properties:
+                  ca:
+                    description: |-
+                      CA selects the iron-proxy MITM CA. When omitted, the operator generates
+                      and preserves a self-signed CA.
+                    properties:
+                      secretRef:
+                        description: |-
+                          SecretRef names a kubernetes.io/tls Secret in the agent's namespace
+                          (keys tls.crt/tls.key) holding a CA certificate and key, the shape a
+                          cert-manager Certificate with isCA: true produces. The operator reads it
+                          but never creates, owns or deletes it, and rolls the pod when it changes.
+                        properties:
+                          name:
+                            default: ""
+                            description: |-
+                              Name of the referent.
+                              This field is effectively required, but due to backwards compatibility is
+                              allowed to be empty. Instances of this type with an empty value here are
+                              almost certainly wrong.
+                              More info: https://kubernetes.io/docs/concepts/overview/working-with-objects/names/#names
+                            type: string
+                        type: object
+                        x-kubernetes-map-type: atomic
+                    type: object
+                  config:
+                    description: Config mirrors hermes-agent's `proxy` config section.
+                    properties:
+                      extraAllowedHosts:
+                        description: |-
+                          ExtraAllowedHosts are allowed on top of the bundled provider hosts.
+                          Wildcards (*.example.com) are supported.
+                        items:
+                          type: string
+                        type: array
+                      extraSecrets:
+                        description: |-
+                          ExtraSecrets are swapped on top of the bundled providers. An entry named
+                          like a bundled provider replaces it.
+                        items:
+                          description: EgressSecret maps a credential to the upstream
+                            hosts it is swapped on.
+                          properties:
+                            aliases:
+                              description: |-
+                                Aliases are extra env var names the agent gets the same token under.
+                                The real value may be stored under any of them in the credentials Secret.
+                              items:
+                                type: string
+                              type: array
+                            hosts:
+                              description: |-
+                                Hosts are the upstream hosts the token is swapped on. They are allowed
+                                implicitly.
+                              items:
+                                type: string
+                              minItems: 1
+                              type: array
+                            matchHeaders:
+                              description: |-
+                                MatchHeaders are the request headers, as case-insensitive regexes,
+                                searched for the token. The query string is always searched too.
+                                Defaults to Authorization.
+                              items:
+                                type: string
+                              type: array
+                            name:
+                              description: |-
+                                Name is the env var the agent reads the credential from, and the key
+                                holding the real value in the credentials Secret.
+                              pattern: ^[A-Za-z_][A-Za-z0-9_]*$
+                              type: string
+                          required:
+                          - hosts
+                          - name
+                          type: object
+                        type: array
+                        x-kubernetes-list-map-keys:
+                        - name
+                        x-kubernetes-list-type: map
+                      tunnelPort:
+                        description: |-
+                          TunnelPort is the port of iron-proxy's CONNECT tunnel listener, which the
+                          agent's HTTPS_PROXY points at. Its plain-HTTP listener, which HTTP_PROXY
+                          points at, uses TunnelPort+1. Both bind loopback only. Defaults to 9090.
+                        format: int32
+                        maximum: 65534
+                        minimum: 1024
+                        type: integer
+                      upstreamDenyCidrs:
+                        description: |-
+                          UpstreamDenyCIDRs are the ranges iron-proxy refuses to dial, checked
+                          against the resolved address whatever the allowlist says. Defaults to
+                          hermes-agent's list: loopback, link-local (cloud metadata), RFC1918, ULA,
+                          IPv4-mapped IPv6, CGNAT and benchmark ranges.
+                        items:
+                          type: string
+                        type: array
+                    type: object
+                  credentials:
+                    description: |-
+                      Credentials names the Secret holding the real provider API keys, keyed by
+                      env var name (e.g. ANTHROPIC_API_KEY). Only the iron-proxy sidecar reads
+                      it. Every key naming a provider hermes-agent knows, and every
+                      config.extraSecrets entry, becomes a proxied credential: the agent gets a
+                      proxy token under that env var name instead of the key.
+                    properties:
+                      secretRef:
+                        description: SecretRef names a Secret in the HermesAgent's
+                          namespace.
+                        properties:
+                          name:
+                            default: ""
+                            description: |-
+                              Name of the referent.
+                              This field is effectively required, but due to backwards compatibility is
+                              allowed to be empty. Instances of this type with an empty value here are
+                              almost certainly wrong.
+                              More info: https://kubernetes.io/docs/concepts/overview/working-with-objects/names/#names
+                            type: string
+                        type: object
+                        x-kubernetes-map-type: atomic
+                    required:
+                    - secretRef
+                    type: object
+                  enabled:
+                    default: false
+                    description: |-
+                      Enabled runs the iron-proxy sidecar and routes the agent's outbound
+                      HTTP(S) through it.
+                    type: boolean
+                  image:
+                    description: |-
+                      Image is the full iron-proxy image reference, by tag or digest.
+                      Defaults to a pinned iron-proxy release.
+                    type: string
+                  resources:
+                    description: Resources specifies compute resources for the iron-proxy
+                      container.
+                    properties:
+                      claims:
+                        description: |-
+                          Claims lists the names of resources, defined in spec.resourceClaims,
+                          that are used by this container.
+
+                          This field depends on the
+                          DynamicResourceAllocation feature gate.
+
+                          This field is immutable. It can only be set for containers.
+                        items:
+                          description: ResourceClaim references one entry in PodSpec.ResourceClaims.
+                          properties:
+                            name:
+                              description: |-
+                                Name must match the name of one entry in pod.spec.resourceClaims of
+                                the Pod where this field is used. It makes that resource available
+                                inside a container.
+                              type: string
+                            request:
+                              description: |-
+                                Request is the name chosen for a request in the referenced claim.
+                                If empty, everything from the claim is made available, otherwise
+                                only the result of this request.
+                              type: string
+                          required:
+                          - name
+                          type: object
+                        type: array
+                        x-kubernetes-list-map-keys:
+                        - name
+                        x-kubernetes-list-type: map
+                      limits:
+                        additionalProperties:
+                          anyOf:
+                          - type: integer
+                          - type: string
+                          pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
+                          x-kubernetes-int-or-string: true
+                        description: |-
+                          Limits describes the maximum amount of compute resources allowed.
+                          More info: https://kubernetes.io/docs/concepts/configuration/manage-resources-containers/
+                        type: object
+                      requests:
+                        additionalProperties:
+                          anyOf:
+                          - type: integer
+                          - type: string
+                          pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
+                          x-kubernetes-int-or-string: true
+                        description: |-
+                          Requests describes the minimum amount of compute resources required.
+                          If Requests is omitted for a container, it defaults to Limits if that is explicitly specified,
+                          otherwise to an implementation-defined value. Requests cannot exceed Limits.
+                          More info: https://kubernetes.io/docs/concepts/configuration/manage-resources-containers/
+                        type: object
+                    type: object
+                type: object
               extraVolumeMounts:
                 description: |-
                   ExtraVolumeMounts adds additional volume mounts to the main container.
@@ -7512,6 +7713,14 @@ spec:
                 description: managedResources describes the Kubernetes resources currently
                   owned by this HermesAgent.
                 properties:
+                  egressCASecret:
+                    description: egressCASecret is the name of the managed iron-proxy
+                      CA Secret.
+                    type: string
+                  egressSecret:
+                    description: egressSecret is the name of the managed iron-proxy
+                      config and proxy token Secret.
+                    type: string
                   hermesConfigMap:
                     description: hermesConfigMap is the name of the Hermes configuration
                       ConfigMap.

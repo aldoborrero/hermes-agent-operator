@@ -75,6 +75,13 @@ func (u *HermesAgentUseCase) reconcileStatefulSet(ctx context.Context, ha *agent
 	configHash := configMapDataHash(cmData)
 
 	desired := buildStatefulSet(ha, configHash)
+	if ha.GetEgress().IsEnabled() {
+		creds, egressHash, err := u.egressPodInputs(ctx, ha)
+		if err != nil {
+			return ctrl.Result{RequeueAfter: 30 * time.Second}, err
+		}
+		desired = buildEgressContainer(ha, desired, creds, egressHash)
+	}
 	hash := desiredSpecHash(desired)
 	if desired.Annotations == nil {
 		desired.Annotations = map[string]string{}
