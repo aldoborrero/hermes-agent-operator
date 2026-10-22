@@ -163,6 +163,41 @@ func renderEgressConfig(t *testing.T, ha *agentsv1alpha1.HermesAgent, keys []str
 }
 
 func TestBuildEgressSecret(t *testing.T) {
+	t.Run("aliases get the canonical credential's token under their own key", func(t *testing.T) {
+		secret, _ := renderEgressConfig(t, egressHA(nil), []string{"GOOGLE_API_KEY"}, nil)
+		gemini, google := string(secret.Data["GEMINI_API_KEY"]), string(secret.Data["GOOGLE_API_KEY"])
+		if gemini == "" || gemini != google {
+			t.Errorf("expected one token under both names, got %q and %q", gemini, google)
+		}
+		raw := string(secret.Data[agentsv1alpha1.EgressProxyConfigKey])
+		if !strings.Contains(raw, "var: GOOGLE_API_KEY") {
+			t.Errorf("expected the real key read from the credentials secret key it is stored under:\n%s", raw)
+		}
+	})
+
+	t.Run("tokens survive re-renders; dropped credentials lose theirs", func(t *testing.T) {
+		ha := egressHA(nil)
+		first, _ := renderEgressConfig(t, ha, []string{"OPENAI_API_KEY", "GROQ_API_KEY"}, nil)
+		second, _ := renderEgressConfig(t, ha, []string{"OPENAI_API_KEY", "XAI_API_KEY"}, first)
+
+		if string(second.Data["OPENAI_API_KEY"]) != string(first.Data["OPENAI_API_KEY"]) {
+			t.Error("expected the OPENAI_API_KEY token to be preserved")
+		}
+		if _, ok := second.Data["GROQ_API_KEY"]; ok {
+			t.Error("expected the GROQ_API_KEY token to be dropped")
+		}
+		if len(second.Data["XAI_API_KEY"]) == 0 {
+			t.Error("expected a token minted for XAI_API_KEY")
+		}
+
+		again, _ := renderEgressConfig(t, ha, []string{"OPENAI_API_KEY", "XAI_API_KEY"}, second)
+		if string(again.Data[agentsv1alpha1.EgressProxyConfigKey]) != string(second.Data[agentsv1alpha1.EgressProxyConfigKey]) {
+			t.Error("expected proxy.yaml to be stable across reconciles")
+		}
+	})
+}
+
+func TestBuildEgressProxyYAML(t *testing.T) {
 	t.Run("proxy.yaml binds loopback and keeps every iron-proxy default port off", func(t *testing.T) {
 		_, cfg := renderEgressConfig(t, egressHA(nil), nil, nil)
 		if cfg.DNS.Enabled {
@@ -230,37 +265,26 @@ func TestBuildEgressSecret(t *testing.T) {
 		if !strings.HasPrefix(string(secret.Data["ANTHROPIC_API_KEY"]), "anthropic-") {
 			t.Errorf("expected a hermes-style token prefix, got %q", secret.Data["ANTHROPIC_API_KEY"])
 		}
-		if strings.Count(raw, "require: false") != 2 || strings.Count(raw, "match_query: true") != 2 {
-			t.Errorf("expected every rule to leave require off, which breaks tunnels, and to search the query:\n%s", raw)
+		if strings.Count(raw, "require: true") != 2 || strings.Count(raw, "match_query: true") != 2 {
+			t.Errorf("expected every rule to fail closed and to search the query:\n%s", raw)
 		}
 	})
 
-	t.Run("aliases get the canonical credential's token under their own key", func(t *testing.T) {
-		secret, _ := renderEgressConfig(t, egressHA(nil), []string{"GOOGLE_API_KEY"}, nil)
-		gemini, google := string(secret.Data["GEMINI_API_KEY"]), string(secret.Data["GOOGLE_API_KEY"])
-		if gemini == "" || gemini != google {
-			t.Errorf("expected one token under both names, got %q and %q", gemini, google)
+	t.Run("secrets rules never match the tunnel connect", func(t *testing.T) {
+		_, cfg := renderEgressConfig(t, egressHA(nil), []string{"OPENROUTER_API_KEY"}, nil)
+		raw, err := yaml.Marshal(cfg.Transforms[1].Config)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var secrets ironProxySecrets
+		if err := yaml.Unmarshal(raw, &secrets); err != nil {
+			t.Fatal(err)
+		}
+		for _, rule := range secrets.Secrets[0].Rules {
+			if len(rule.Methods) == 0 || slices.Contains(rule.Methods, "CONNECT") {
+				t.Errorf("rule %q must list methods without CONNECT, got %v", rule.Host, rule.Methods)
+			}
 		}
 	})
 
-	t.Run("tokens survive re-renders; dropped credentials lose theirs", func(t *testing.T) {
-		ha := egressHA(nil)
-		first, _ := renderEgressConfig(t, ha, []string{"OPENAI_API_KEY", "GROQ_API_KEY"}, nil)
-		second, _ := renderEgressConfig(t, ha, []string{"OPENAI_API_KEY", "XAI_API_KEY"}, first)
-
-		if string(second.Data["OPENAI_API_KEY"]) != string(first.Data["OPENAI_API_KEY"]) {
-			t.Error("expected the OPENAI_API_KEY token to be preserved")
-		}
-		if _, ok := second.Data["GROQ_API_KEY"]; ok {
-			t.Error("expected the GROQ_API_KEY token to be dropped")
-		}
-		if len(second.Data["XAI_API_KEY"]) == 0 {
-			t.Error("expected a token minted for XAI_API_KEY")
-		}
-
-		again, _ := renderEgressConfig(t, ha, []string{"OPENAI_API_KEY", "XAI_API_KEY"}, second)
-		if string(again.Data[agentsv1alpha1.EgressProxyConfigKey]) != string(second.Data[agentsv1alpha1.EgressProxyConfigKey]) {
-			t.Error("expected proxy.yaml to be stable across reconciles")
-		}
-	})
 }

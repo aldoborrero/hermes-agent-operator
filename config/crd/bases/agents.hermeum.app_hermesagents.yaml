@@ -374,7 +374,8 @@ spec:
                             hosts:
                               description: |-
                                 Hosts are the upstream hosts the token is swapped on. They are allowed
-                                implicitly.
+                                implicitly, and must not overlap another credential's hosts: iron-proxy
+                                requires each credential's token on its hosts.
                               items:
                                 type: string
                               minItems: 1

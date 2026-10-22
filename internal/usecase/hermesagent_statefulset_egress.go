@@ -3,8 +3,11 @@ package usecase
 import (
 	"context"
 	"crypto/sha256"
+	"errors"
 	"fmt"
 	"maps"
+	"path"
+	"regexp"
 	"slices"
 
 	agentsv1alpha1 "hermeum/hermes-agent-operator/api/v1alpha1"
@@ -14,33 +17,31 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 )
 
+// egressUID/egressGID are the uid/gid of the iron-proxy image user (distroless
+// nonroot).
 const (
-	egressContainerName = "iron-proxy"
-	egressConfigVolume  = "egress-config"
-	egressAgentCAVolume = "egress-agent-ca"
-	// egressAgentCADir is where the agent container mounts the CA certificate,
-	// never the key, to trust iron-proxy's MITM certificates.
-	egressAgentCADir = "/etc/hermes-egress"
-	// egressNoProxy keeps in-pod and in-cluster traffic, including the
-	// Kubernetes API reached by IP, off the proxy.
-	egressNoProxy = "localhost,127.0.0.1,.svc,.cluster.local,$(KUBERNETES_SERVICE_HOST)"
+	egressUID = int64(65532)
+	egressGID = int64(65532)
 )
 
-// egressPodInputs reads what the egress wiring needs beyond the spec: the
-// resolved credentials, and a hash of everything the pod reads only at start
-// (the CA certificate, the egress Secret and the real keys) so that rotating
-// any of them restarts it.
-func (u *HermesAgentUseCase) egressPodInputs(ctx context.Context, ha *agentsv1alpha1.HermesAgent) ([]agentsv1alpha1.EgressCredential, string, error) {
-	creds, err := u.resolveEgressCredentials(ctx, ha)
-	if err != nil {
-		return nil, "", err
-	}
+// egressTokenKey matches the egress Secret keys that hold proxy tokens: env
+// var names, unlike proxy.yaml.
+var egressTokenKey = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`)
 
+// errEgressInputsPending reports that a Secret the egress wiring reads is not
+// visible yet, typically one the egress reconcilers created moments ago that
+// has not reached the cache. Building the pod without it would roll it out
+// without the agent's proxy tokens, then restart it once they appear.
+var errEgressInputsPending = errors.New("egress Secrets not visible yet")
+
+// egressPodInputs reads what the egress wiring needs beyond the spec, from the
+// Secrets the egress reconcilers already ensured: the env var names that carry
+// proxy tokens, and a hash of everything the pod reads only at start (the CA
+// certificate, the egress Secret and the real keys) so that rotating any of
+// them restarts it. It returns errEgressInputsPending while any of those
+// Secrets is missing.
+func (u *HermesAgentUseCase) egressPodInputs(ctx context.Context, ha *agentsv1alpha1.HermesAgent) (tokenNames []string, hash string, err error) {
 	caName, caCertKey, _ := ha.GetEgressCASource()
-	sourceKeys := make([]string, 0, len(creds))
-	for _, c := range creds {
-		sourceKeys = append(sourceKeys, c.SourceKey)
-	}
 
 	// The real keys only enter a truncated SHA-256 over every input, which
 	// does not disclose them.
@@ -51,17 +52,17 @@ func (u *HermesAgentUseCase) egressPodInputs(ctx context.Context, ha *agentsv1al
 	}{
 		{name: caName, keys: []string{caCertKey}},
 		{name: ha.GetEgressSecretName()},
-		{name: ha.GetEgress().GetCredentialsSecretName(), keys: sourceKeys},
+		{name: ha.GetEgress().GetCredentialsSecretName()},
 	} {
 		if src.name == "" {
 			continue
 		}
 		secret, err := u.kube.GetSecret(ctx, GetSecretParam{NamespacedName: types.NamespacedName{Name: src.name, Namespace: ha.Namespace}})
 		if err != nil {
-			return nil, "", err
+			return nil, "", fmt.Errorf("reading egress input Secret %q: %w", src.name, err)
 		}
 		if secret == nil {
-			continue
+			return nil, "", fmt.Errorf("%w: %q", errEgressInputsPending, src.name)
 		}
 		keys := src.keys
 		if keys == nil {
@@ -70,8 +71,15 @@ func (u *HermesAgentUseCase) egressPodInputs(ctx context.Context, ha *agentsv1al
 		for _, k := range keys {
 			_, _ = fmt.Fprintf(h, "%s\x00%s\x00%s\x00", src.name, k, secret.Data[k])
 		}
+		if src.name == ha.GetEgressSecretName() {
+			for _, k := range keys {
+				if egressTokenKey.MatchString(k) {
+					tokenNames = append(tokenNames, k)
+				}
+			}
+		}
 	}
-	return creds, fmt.Sprintf("%x", h.Sum(nil))[:16], nil
+	return tokenNames, fmt.Sprintf("%x", h.Sum(nil))[:16], nil
 }
 
 // buildEgressContainerSecurityContext returns a hardened security context for
@@ -80,13 +88,14 @@ func (u *HermesAgentUseCase) egressPodInputs(ctx context.Context, ha *agentsv1al
 func buildEgressContainerSecurityContext() *corev1.SecurityContext {
 	ape := false
 	rot := true
-	uid := int64(65532)
+	uid := egressUID
+	gid := egressGID
 	rofs := true
 	return &corev1.SecurityContext{
 		AllowPrivilegeEscalation: &ape,
 		RunAsNonRoot:             &rot,
 		RunAsUser:                &uid,
-		RunAsGroup:               &uid,
+		RunAsGroup:               &gid,
 		ReadOnlyRootFilesystem:   &rofs,
 		Capabilities: &corev1.Capabilities{
 			Drop: []corev1.Capability{"ALL"},
@@ -97,13 +106,12 @@ func buildEgressContainerSecurityContext() *corev1.SecurityContext {
 	}
 }
 
-// buildEgressContainer adds the iron-proxy sidecar and routes the agent's
-// outbound HTTP(S) through it. Each credential's real value is read into the
-// sidecar's env from the credentials Secret; the agent gets the credential's
-// proxy token under the same env var name, and its aliases, instead. Those
-// env entries are appended last, so they shadow a real key reaching the agent
-// through spec.hermes.envFrom or spec.hermes.env.
-func buildEgressContainer(ha *agentsv1alpha1.HermesAgent, sts *appsv1.StatefulSet, creds []agentsv1alpha1.EgressCredential, inputsHash string) *appsv1.StatefulSet {
+// buildEgressContainer adds the iron-proxy sidecar, which reads the real keys
+// from the credentials Secret. The agent reaches it through the proxy env vars
+// and proxy tokens every profile's .env carries (see buildHermesContainer).
+// The agent's env gets the tokens as well, appended last, so that a real key
+// passed through spec.hermes.env or envFrom never reaches its environment.
+func buildEgressContainer(ha *agentsv1alpha1.HermesAgent, sts *appsv1.StatefulSet, tokenNames []string, inputsHash string) *appsv1.StatefulSet {
 	sts = sts.DeepCopy()
 
 	eg := ha.GetEgress()
@@ -111,8 +119,12 @@ func buildEgressContainer(ha *agentsv1alpha1.HermesAgent, sts *appsv1.StatefulSe
 		return sts
 	}
 
+	const (
+		egressContainerName = "iron-proxy"
+		egressConfigVolume  = "egress-config"
+		egressAgentCAVolume = "egress-agent-ca"
+	)
 	caName, caCertKey, caKeyKey := ha.GetEgressCASource()
-	agentCAPath := egressAgentCADir + "/" + agentsv1alpha1.EgressCAManagedCertKey
 
 	if sts.Spec.Template.Annotations == nil {
 		sts.Spec.Template.Annotations = map[string]string{}
@@ -120,47 +132,29 @@ func buildEgressContainer(ha *agentsv1alpha1.HermesAgent, sts *appsv1.StatefulSe
 	sts.Spec.Template.Annotations[domain+"/egress-hash"] = inputsHash
 
 	if c := findContainer(sts, hermesContainerName); c != nil {
-		for _, kv := range [][2]string{
-			{"HTTPS_PROXY", eg.GetHTTPSProxyURL()},
-			{"https_proxy", eg.GetHTTPSProxyURL()},
-			{"HTTP_PROXY", eg.GetHTTPProxyURL()},
-			{"http_proxy", eg.GetHTTPProxyURL()},
-			{"NO_PROXY", egressNoProxy},
-			{"no_proxy", egressNoProxy},
-			{"SSL_CERT_FILE", agentCAPath},
-			{"REQUESTS_CA_BUNDLE", agentCAPath},
-			{"NODE_EXTRA_CA_CERTS", agentCAPath},
-			{"GIT_SSL_CAINFO", agentCAPath},
-		} {
-			c.Env = append(c.Env, corev1.EnvVar{Name: kv[0], Value: kv[1]})
-		}
-		for _, cred := range creds {
-			for _, name := range cred.EnvNames() {
-				c.Env = append(c.Env, corev1.EnvVar{
-					Name: name,
-					ValueFrom: &corev1.EnvVarSource{SecretKeyRef: &corev1.SecretKeySelector{
-						LocalObjectReference: corev1.LocalObjectReference{Name: ha.GetEgressSecretName()},
-						Key:                  name,
-					}},
-				})
-			}
+		for _, name := range tokenNames {
+			c.Env = append(c.Env, corev1.EnvVar{
+				Name: name,
+				ValueFrom: &corev1.EnvVarSource{SecretKeyRef: &corev1.SecretKeySelector{
+					LocalObjectReference: corev1.LocalObjectReference{Name: ha.GetEgressSecretName()},
+					Key:                  name,
+				}},
+			})
 		}
 		c.VolumeMounts = append(c.VolumeMounts, corev1.VolumeMount{
 			Name:      egressAgentCAVolume,
-			MountPath: egressAgentCADir,
+			MountPath: path.Dir(agentsv1alpha1.EgressAgentCAPath),
 			ReadOnly:  true,
 		})
 	}
 
-	env := make([]corev1.EnvVar, 0, len(creds))
-	for _, cred := range creds {
-		env = append(env, corev1.EnvVar{
-			Name: cred.Name,
-			ValueFrom: &corev1.EnvVarSource{SecretKeyRef: &corev1.SecretKeySelector{
-				LocalObjectReference: corev1.LocalObjectReference{Name: eg.GetCredentialsSecretName()},
-				Key:                  cred.SourceKey,
-			}},
-		})
+	// proxy.yaml reads each real key from the env var named like its key in
+	// the credentials Secret.
+	var envFrom []corev1.EnvFromSource
+	if name := eg.GetCredentialsSecretName(); name != "" {
+		envFrom = []corev1.EnvFromSource{{SecretRef: &corev1.SecretEnvSource{
+			LocalObjectReference: corev1.LocalObjectReference{Name: name},
+		}}}
 	}
 
 	sts.Spec.Template.Spec.Containers = append(sts.Spec.Template.Spec.Containers, corev1.Container{
@@ -168,7 +162,7 @@ func buildEgressContainer(ha *agentsv1alpha1.HermesAgent, sts *appsv1.StatefulSe
 		Image:           eg.GetImage(),
 		ImagePullPolicy: corev1.PullIfNotPresent,
 		Args:            []string{"-config", agentsv1alpha1.EgressConfigDir + "/" + agentsv1alpha1.EgressProxyConfigKey},
-		Env:             env,
+		EnvFrom:         envFrom,
 		Resources:       eg.GetResources(),
 		SecurityContext: buildEgressContainerSecurityContext(),
 		VolumeMounts: []corev1.VolumeMount{
@@ -206,7 +200,7 @@ func buildEgressContainer(ha *agentsv1alpha1.HermesAgent, sts *appsv1.StatefulSe
 			VolumeSource: corev1.VolumeSource{
 				Secret: &corev1.SecretVolumeSource{
 					SecretName:  caName,
-					Items:       []corev1.KeyToPath{{Key: caCertKey, Path: agentsv1alpha1.EgressCAManagedCertKey}},
+					Items:       []corev1.KeyToPath{{Key: caCertKey, Path: path.Base(agentsv1alpha1.EgressAgentCAPath)}},
 					DefaultMode: &defaultMode,
 				},
 			},

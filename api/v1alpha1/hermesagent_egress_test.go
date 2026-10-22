@@ -66,6 +66,24 @@ func TestEgress_ResolveCredentials(t *testing.T) {
 			errPart: `extraSecrets "API_TOKEN"`,
 		},
 		{
+			name:    "an extra secret on a bundled provider's host",
+			extra:   []EgressSecret{{Name: "OPENAI_ORG_TOKEN", Hosts: []string{"api.openai.com"}}},
+			keys:    []string{"OPENAI_ORG_TOKEN", "OPENAI_API_KEY"},
+			errPart: `both swap on host "api.openai.com"`,
+		},
+		{
+			name:    "an extra secret under a bundled provider's wildcard",
+			extra:   []EgressSecret{{Name: "OR_TOKEN", Hosts: []string{"api.openrouter.ai"}}},
+			keys:    []string{"OR_TOKEN", "OPENROUTER_API_KEY"},
+			errPart: `both swap on host "api.openrouter.ai"`,
+		},
+		{
+			name:     "an extra secret on its own host",
+			extra:    []EgressSecret{{Name: "API_TOKEN", Hosts: []string{"api.example.com"}}},
+			keys:     []string{"API_TOKEN", "OPENAI_API_KEY"},
+			expected: []string{"OPENAI_API_KEY<-OPENAI_API_KEY", "API_TOKEN<-API_TOKEN"},
+		},
+		{
 			name:    "an alias claimed by another credential",
 			extra:   []EgressSecret{{Name: "API_TOKEN", Hosts: []string{"api.example.com"}, Aliases: []string{"OPENAI_API_KEY"}}},
 			keys:    []string{"API_TOKEN", "OPENAI_API_KEY"},
@@ -108,6 +126,29 @@ func TestEgress_ResolveCredentials(t *testing.T) {
 			t.Errorf("got %v, %v", creds, err)
 		}
 	})
+}
+
+func TestHostsOverlap(t *testing.T) {
+	tests := []struct {
+		a, b     string
+		expected bool
+	}{
+		{"api.example.com", "api.example.com", true},
+		{"API.example.com", "api.example.com", true},
+		{"*.example.com", "api.example.com", true},
+		{"api.example.com", "*.example.com", true},
+		{"*.example.com", "*.api.example.com", true},
+		{"*.example.com", "example.com", false},
+		{"api.example.com", "www.example.com", false},
+		{"*.example.com", "*.example.org", false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.a+" vs "+tt.b, func(t *testing.T) {
+			if got := hostsOverlap(tt.a, tt.b); got != tt.expected {
+				t.Errorf("hostsOverlap(%q, %q) = %v, expected %v", tt.a, tt.b, got, tt.expected)
+			}
+		})
+	}
 }
 
 func TestEgressSecret_GetMatchHeaders(t *testing.T) {

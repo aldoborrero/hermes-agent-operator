@@ -50,8 +50,15 @@ const EgressProxyConfigKey = "proxy.yaml"
 // as ca.crt/ca.key whatever the source Secret's keys are.
 const EgressConfigDir = "/etc/iron-proxy"
 
-// defaultEgressAllowedHosts mirrors hermes-agent's _DEFAULT_ALLOWED_HOSTS
-// (agent/proxy_sources/iron_proxy.py): the inference endpoints always allowed.
+// EgressAgentCAPath is where the agent container mounts the proxy's CA
+// certificate, never its key.
+const EgressAgentCAPath = "/etc/hermes-egress/ca.crt"
+
+// The tables below mirror agent/proxy_sources/iron_proxy.py in hermes-agent as
+// of commit eb3f8c7 (2026-10-19). Compare against it when updating them.
+
+// defaultEgressAllowedHosts mirrors hermes-agent's _DEFAULT_ALLOWED_HOSTS: the
+// inference endpoints always allowed.
 var defaultEgressAllowedHosts = []string{
 	"openrouter.ai", "*.openrouter.ai", "api.openai.com", "api.anthropic.com", "generativelanguage.googleapis.com",
 	"api.x.ai", "api.mistral.ai", "api.groq.com", "api.together.xyz", "api.deepseek.com", "inference.nousresearch.com",
@@ -183,7 +190,8 @@ type EgressSecret struct {
 	// +kubebuilder:validation:Required
 	Name string `json:"name"`
 	// Hosts are the upstream hosts the token is swapped on. They are allowed
-	// implicitly.
+	// implicitly, and must not overlap another credential's hosts: iron-proxy
+	// requires each credential's token on its hosts.
 	// +listType=set
 	// +kubebuilder:validation:MinItems=1
 	// +kubebuilder:validation:Required
@@ -270,6 +278,26 @@ func (e *Egress) GetHTTPProxyURL() string {
 	return fmt.Sprintf("http://127.0.0.1:%d", e.GetTunnelPort()+1)
 }
 
+// GetAgentProxyEnv returns the env vars that route the agent through the proxy
+// and make it trust the proxy's CA. They go to every profile's .env, which
+// hermes-agent reads, so NO_PROXY uses the ${VAR} interpolation of its .env
+// parser to exempt the Kubernetes API server, which clients reach by IP.
+func (e *Egress) GetAgentProxyEnv() map[string]string {
+	const noProxy = "localhost,127.0.0.1,.svc,.cluster.local,${KUBERNETES_SERVICE_HOST}"
+	return map[string]string{
+		"HTTPS_PROXY":         e.GetHTTPSProxyURL(),
+		"https_proxy":         e.GetHTTPSProxyURL(),
+		"HTTP_PROXY":          e.GetHTTPProxyURL(),
+		"http_proxy":          e.GetHTTPProxyURL(),
+		"NO_PROXY":            noProxy,
+		"no_proxy":            noProxy,
+		"SSL_CERT_FILE":       EgressAgentCAPath,
+		"REQUESTS_CA_BUNDLE":  EgressAgentCAPath,
+		"NODE_EXTRA_CA_CERTS": EgressAgentCAPath,
+		"GIT_SSL_CAINFO":      EgressAgentCAPath,
+	}
+}
+
 // GetUpstreamDenyCIDRs returns the configured deny list, or nil to use
 // hermes-agent's default.
 func (e *Egress) GetUpstreamDenyCIDRs() []string {
@@ -326,7 +354,6 @@ func (e *Egress) ResolveCredentials(keys []string) ([]EgressCredential, error) {
 	}
 
 	var creds []EgressCredential
-	envNames := map[string]string{}
 	for _, s := range specs {
 		k := sourceKey(s)
 		if k == "" {
@@ -335,18 +362,50 @@ func (e *Egress) ResolveCredentials(keys []string) ([]EgressCredential, error) {
 			}
 			continue
 		}
-		// Each env var name carries exactly one token; two credentials
-		// claiming it would leave the agent with only one of them.
-		for _, name := range s.EnvNames() {
-			if owner, taken := envNames[name]; taken {
-				return nil, fmt.Errorf("credentials %q and %q both use env var %q", owner, s.Name, name)
-			}
-			envNames[name] = s.Name
-		}
 		// Deep copy: specs share slices with the package-level provider table.
 		creds = append(creds, EgressCredential{EgressSecret: *s.DeepCopy(), SourceKey: k})
 	}
+	if err := checkCredentialClaims(creds); err != nil {
+		return nil, err
+	}
 	return creds, nil
+}
+
+// checkCredentialClaims rejects two credentials claiming the same env var
+// name or an overlapping host. An env var carries a single token, so the
+// agent would get only one of them. And every secrets rule requires its own
+// token, so on a shared host each credential's requests would fail the other
+// credential's rule.
+func checkCredentialClaims(creds []EgressCredential) error {
+	envNames := map[string]string{}
+	for i, c := range creds {
+		for _, name := range c.EnvNames() {
+			if owner, taken := envNames[name]; taken {
+				return fmt.Errorf("credentials %q and %q both use env var %q", owner, c.Name, name)
+			}
+			envNames[name] = c.Name
+		}
+		for _, other := range creds[:i] {
+			for _, h := range c.Hosts {
+				for _, oh := range other.Hosts {
+					if hostsOverlap(h, oh) {
+						return fmt.Errorf("credentials %q and %q both swap on host %q", other.Name, c.Name, h)
+					}
+				}
+			}
+		}
+	}
+	return nil
+}
+
+// hostsOverlap reports whether one request host can match both patterns.
+// iron-proxy matches a host exactly, or by suffix for "*.example.com".
+func hostsOverlap(a, b string) bool {
+	a, b = strings.ToLower(a), strings.ToLower(b)
+	covers := func(pattern, host string) bool {
+		return strings.HasPrefix(pattern, "*.") && strings.HasSuffix(host, pattern[1:])
+	}
+	return a == b || covers(a, b) || covers(b, a)
 }
 
 // EnvNames returns the env var names the agent gets this credential's token
@@ -413,10 +472,15 @@ func (h *HermesAgent) GetEgressSourceSecretNames() []string {
 func (h *HermesAgent) ValidateEgressSecretRefs() error {
 	e := h.GetEgress()
 	creds, ca := e.GetCredentialsSecretName(), e.GetCASecretRefName()
+	managed := []string{h.GetEgressSecretName(), h.GetEgressCASecretName()}
+	credsCollide := creds != "" && slices.Contains(managed, creds)
+	// A user CA may take the managed CA's name: the CA reconciler then reads it
+	// as the user's and never deletes it.
+	caCollides := ca != "" && ca == h.GetEgressSecretName()
 	switch {
-	case creds != "" && (creds == h.GetEgressSecretName() || creds == h.GetEgressCASecretName()):
+	case credsCollide:
 		return fmt.Errorf("egress credentials Secret %q collides with a Secret the operator manages", creds)
-	case ca != "" && ca == h.GetEgressSecretName():
+	case caCollides:
 		return fmt.Errorf("egress CA Secret %q collides with a Secret the operator manages", ca)
 	}
 	return nil

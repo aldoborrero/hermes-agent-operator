@@ -2,6 +2,8 @@ package usecase
 
 import (
 	"fmt"
+	"maps"
+	"slices"
 	"strconv"
 
 	agentsv1alpha1 "hermeum/hermes-agent-operator/api/v1alpha1"
@@ -584,6 +586,24 @@ func buildOperatorDotEnvItems(ha *agentsv1alpha1.HermesAgent) []corev1.KeyToPath
 	if ha.GetCamofox().IsEnabled() {
 		items = append(items, corev1.KeyToPath{Key: "CAMOFOX_URL", Path: "CAMOFOX_URL"})
 	}
+	items = append(items, buildEgressDotEnvItems(ha)...)
+	return items
+}
+
+// buildEgressDotEnvItems returns the Items filter for the proxy env vars the
+// Hermes ConfigMap holds while egress is on. They go to every profile's .env:
+// hermes-agent resolves a profile's settings from its .env, not from the
+// container env.
+func buildEgressDotEnvItems(ha *agentsv1alpha1.HermesAgent) []corev1.KeyToPath {
+	eg := ha.GetEgress()
+	if !eg.IsEnabled() {
+		return nil
+	}
+	keys := slices.Sorted(maps.Keys(eg.GetAgentProxyEnv()))
+	items := make([]corev1.KeyToPath, 0, len(keys))
+	for _, k := range keys {
+		items = append(items, corev1.KeyToPath{Key: k, Path: k})
+	}
 	return items
 }
 
@@ -612,5 +632,6 @@ func buildProfileSidecarDotEnvItems(ha *agentsv1alpha1.HermesAgent) []corev1.Key
 	if ha.GetCamofox().IsEnabled() {
 		items = append(items, corev1.KeyToPath{Key: "CAMOFOX_URL", Path: "CAMOFOX_URL"})
 	}
+	items = append(items, buildEgressDotEnvItems(ha)...)
 	return items
 }

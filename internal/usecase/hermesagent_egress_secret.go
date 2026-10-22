@@ -237,8 +237,16 @@ type ironProxySecretReplace struct {
 }
 
 type ironProxyRule struct {
-	Host string `json:"host"`
+	Host    string   `json:"host"`
+	Methods []string `json:"methods"`
 }
+
+// egressRuleMethods are the methods a secrets rule matches: every request
+// method but CONNECT. iron-proxy runs its transforms on the tunnel CONNECT
+// too, which carries no token, so with require on, a rule that matched it
+// would reject every tunnel to the credential's hosts. Inside the tunnel,
+// require still rejects a request that carries no token, or a real key.
+var egressRuleMethods = []string{"GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"}
 
 type ironProxyLog struct {
 	Level string `json:"level"`
@@ -248,8 +256,8 @@ type ironProxyLog struct {
 // build_proxy_config, adapted to a sidecar: every listener binds loopback,
 // which the agent shares with the sidecar and nothing outside the pod can
 // reach; DNS interception is off since the agent goes through HTTPS_PROXY.
-// Each credential's real value comes from the sidecar's env var of the same
-// name.
+// Each credential's real value comes from the sidecar's env var named like
+// the credentials Secret key that holds it, which envFrom provides.
 func buildEgressProxyYAML(ha *agentsv1alpha1.HermesAgent, creds []agentsv1alpha1.EgressCredential, tokens map[string]string) (string, error) {
 	eg := ha.GetEgress()
 	port := eg.GetTunnelPort()
@@ -259,21 +267,18 @@ func buildEgressProxyYAML(ha *agentsv1alpha1.HermesAgent, creds []agentsv1alpha1
 	for _, c := range creds {
 		rules := make([]ironProxyRule, 0, len(c.Hosts))
 		for _, h := range c.Hosts {
-			rules = append(rules, ironProxyRule{Host: h})
+			rules = append(rules, ironProxyRule{Host: h, Methods: slices.Clone(egressRuleMethods)})
 			if !slices.Contains(domains, h) {
 				domains = append(domains, h)
 			}
 		}
 		secrets = append(secrets, ironProxySecret{
-			Source: ironProxySecretSource{Type: "env", Var: c.Name},
+			Source: ironProxySecretSource{Type: "env", Var: c.SourceKey},
 			Replace: ironProxySecretReplace{
 				ProxyValue:   tokens[c.Name],
 				MatchHeaders: c.GetMatchHeaders(),
 				MatchQuery:   true,
-				// Unlike hermes-agent, require stays off: iron-proxy (0.49 to 0.53)
-				// evaluates it on the tunnel CONNECT too, which carries no token, so
-				// it would reject every request to the credential's hosts.
-				Require: false,
+				Require:      true,
 			},
 			Rules: rules,
 		})
@@ -317,4 +322,26 @@ func buildEgressProxyYAML(ha *agentsv1alpha1.HermesAgent, creds []agentsv1alpha1
 		return "", fmt.Errorf("marshaling iron-proxy config: %w", err)
 	}
 	return string(out), nil
+}
+
+// resolveEgressCredentials resolves the credentials iron-proxy swaps against
+// the keys of the egress credentials Secret, which must exist when it is
+// referenced.
+func (u *HermesAgentUseCase) resolveEgressCredentials(ctx context.Context, ha *agentsv1alpha1.HermesAgent) ([]agentsv1alpha1.EgressCredential, error) {
+	if err := ha.ValidateEgressSecretRefs(); err != nil {
+		return nil, err
+	}
+	eg := ha.GetEgress()
+	var keys []string
+	if name := eg.GetCredentialsSecretName(); name != "" {
+		secret, err := u.kube.GetSecret(ctx, GetSecretParam{NamespacedName: types.NamespacedName{Name: name, Namespace: ha.Namespace}})
+		if err != nil {
+			return nil, fmt.Errorf("reading egress credentials Secret %q: %w", name, err)
+		}
+		if secret == nil {
+			return nil, fmt.Errorf("egress credentials Secret %q not found", name)
+		}
+		keys = slices.Collect(maps.Keys(secret.Data))
+	}
+	return eg.ResolveCredentials(keys)
 }

@@ -335,14 +335,15 @@ printf '%%s' "$DESIRED" > "$MANIFEST"
 }
 
 // buildDotEnvScript writes the profile's .env from the files in mountPaths,
-// one KEY=value line per file. When egressTokensDir is set, a key with a
-// proxy token there gets the token instead of its value: hermes-agent lets
-// .env override the process env, so a real key left in .env would both sit
-// on the agent's volume and win over the token the agent's env carries.
+// one KEY=value line per file. When egressTokensDir is set, the .env also gets
+// every proxy token there, and a key that has a token never gets its own
+// value: hermes-agent resolves a profile's credentials from its .env and lets
+// .env override the process env, so a real key left in .env would both sit on
+// the agent's volume and win over the token.
 func buildDotEnvScript(profile, egressTokensDir string, mountPaths ...string) string {
-	tokenOverride := ""
+	skipTokenKey := ""
 	if egressTokensDir != "" {
-		tokenOverride = fmt.Sprintf(`    if [ -f "%[1]s/$key" ]; then value="$(cat "%[1]s/$key")"; fi
+		skipTokenKey = fmt.Sprintf(`    if [ -f "%s/$key" ]; then continue; fi
 `, egressTokensDir)
 	}
 	var body strings.Builder
@@ -350,10 +351,20 @@ func buildDotEnvScript(profile, egressTokensDir string, mountPaths ...string) st
 		fmt.Fprintf(&body, `  for f in "%s"/*; do
     [ -f "$f" ] || continue
     key="$(basename "$f")"
-    value="$(cat "$f")"
-%s    printf '%%s=%%s\n' "$key" "$value"
+%s    value="$(cat "$f")"
+    printf '%%s=%%s\n' "$key" "$value"
   done
-`, mp, tokenOverride)
+`, mp, skipTokenKey)
+	}
+	if egressTokensDir != "" {
+		// The egress Secret also holds proxy.yaml: only env var names are tokens.
+		fmt.Fprintf(&body, `  for f in "%s"/*; do
+    [ -f "$f" ] || continue
+    key="$(basename "$f")"
+    case "$key" in *[!A-Za-z0-9_]*) continue ;; esac
+    printf '%%s=%%s\n' "$key" "$(cat "$f")"
+  done
+`, egressTokensDir)
 	}
 	return fmt.Sprintf(`set -eu
 {

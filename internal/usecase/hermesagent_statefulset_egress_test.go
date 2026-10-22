@@ -2,6 +2,7 @@ package usecase
 
 import (
 	"context"
+	"errors"
 	"slices"
 	"testing"
 
@@ -21,78 +22,89 @@ func findEnv(envs []corev1.EnvVar, name string) *corev1.EnvVar {
 
 func TestEgressPodInputs(t *testing.T) {
 	ha := egressHA(nil)
-	inputs := func(t *testing.T, secrets map[string]*corev1.Secret) string {
-		t.Helper()
-		_, hash, err := NewHermesAgentUseCase(newFakeEgressKube(secrets), silentTelemetry{}).egressPodInputs(context.Background(), ha)
-		if err != nil {
-			t.Fatal(err)
-		}
-		return hash
-	}
 	base := func() map[string]*corev1.Secret {
 		return map[string]*corev1.Secret{
-			egressCredsSecret:          credsSecret("OPENROUTER_API_KEY"),
-			ha.GetEgressSecretName():   {Data: map[string][]byte{"OPENROUTER_API_KEY": []byte("token")}},
+			egressCredsSecret: credsSecret("OPENROUTER_API_KEY"),
+			ha.GetEgressSecretName(): {Data: map[string][]byte{
+				"OPENROUTER_API_KEY":                []byte("token"),
+				"GOOGLE_API_KEY":                    []byte("token2"),
+				agentsv1alpha1.EgressProxyConfigKey: []byte("dns: {}"),
+			}},
 			ha.GetEgressCASecretName(): {Data: map[string][]byte{"ca.crt": []byte("cert"), "ca.key": []byte("key")}},
 		}
 	}
-	baseline := inputs(t, base())
+	inputs := func(t *testing.T, secrets map[string]*corev1.Secret) ([]string, string) {
+		t.Helper()
+		names, hash, err := NewHermesAgentUseCase(newFakeEgressKube(secrets), silentTelemetry{}).egressPodInputs(context.Background(), ha)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return names, hash
+	}
+
+	names, baseline := inputs(t, base())
+	if !slices.Equal(names, []string{"GOOGLE_API_KEY", "OPENROUTER_API_KEY"}) {
+		t.Errorf("expected the token names without proxy.yaml, got %v", names)
+	}
 
 	tests := []struct {
-		name        string
-		mutate      func(map[string]*corev1.Secret)
-		expectRolls bool
+		name   string
+		mutate func(map[string]*corev1.Secret)
 	}{
 		{
-			name:        "rotating a real key",
-			mutate:      func(s map[string]*corev1.Secret) { s[egressCredsSecret].Data["OPENROUTER_API_KEY"] = []byte("rotated") },
-			expectRolls: true,
+			name:   "rotating a real key",
+			mutate: func(s map[string]*corev1.Secret) { s[egressCredsSecret].Data["OPENROUTER_API_KEY"] = []byte("rotated") },
 		},
 		{
-			name:        "rotating the ca certificate",
-			mutate:      func(s map[string]*corev1.Secret) { s[ha.GetEgressCASecretName()].Data["ca.crt"] = []byte("new") },
-			expectRolls: true,
+			name:   "rotating the ca certificate",
+			mutate: func(s map[string]*corev1.Secret) { s[ha.GetEgressCASecretName()].Data["ca.crt"] = []byte("new") },
 		},
 		{
 			name: "changing the egress secret",
 			mutate: func(s map[string]*corev1.Secret) {
 				s[ha.GetEgressSecretName()].Data["OPENROUTER_API_KEY"] = []byte("new")
 			},
-			expectRolls: true,
-		},
-		{
-			name:   "changing a credentials secret key that is no credential",
-			mutate: func(s map[string]*corev1.Secret) { s[egressCredsSecret].Data["UNRELATED"] = []byte("x") },
 		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			secrets := base()
 			tt.mutate(secrets)
-			if rolls := inputs(t, secrets) != baseline; rolls != tt.expectRolls {
-				t.Errorf("pod restart: got %v, expected %v", rolls, tt.expectRolls)
+			if _, hash := inputs(t, secrets); hash == baseline {
+				t.Error("expected the pod to restart")
 			}
 		})
 	}
+
+	t.Run("waits for a secret the cache does not hold yet", func(t *testing.T) {
+		for _, missing := range []string{egressCredsSecret, ha.GetEgressSecretName(), ha.GetEgressCASecretName()} {
+			secrets := base()
+			delete(secrets, missing)
+			_, _, err := NewHermesAgentUseCase(newFakeEgressKube(secrets), silentTelemetry{}).egressPodInputs(context.Background(), ha)
+			if !errors.Is(err, errEgressInputsPending) {
+				t.Errorf("without %s: expected errEgressInputsPending, got %v", missing, err)
+			}
+		}
+	})
+
+	t.Run("the ca key alone does not restart the pod", func(t *testing.T) {
+		secrets := base()
+		secrets[ha.GetEgressCASecretName()].Data["ca.key"] = []byte("other")
+		if _, hash := inputs(t, secrets); hash != baseline {
+			t.Error("expected the same hash")
+		}
+	})
 }
 
-// egressContainerFixture returns an egress-enabled agent and the credentials
-// it resolves from a Secret holding OpenRouter and Google (Gemini alias) keys.
-func egressContainerFixture(t *testing.T) (*agentsv1alpha1.HermesAgent, []agentsv1alpha1.EgressCredential) {
-	t.Helper()
-	ha := egressHA(nil)
-	creds, err := ha.GetEgress().ResolveCredentials([]string{"OPENROUTER_API_KEY", "GOOGLE_API_KEY"})
-	if err != nil {
-		t.Fatal(err)
-	}
-	return ha, creds
-}
-
-// TestBuildEgressContainerEnv checks the agent gets proxy tokens and proxy
-// env while the sidecar gets the real keys.
+// TestBuildEgressContainerEnv checks the agent gets proxy tokens while the
+// sidecar gets the real keys.
 func TestBuildEgressContainerEnv(t *testing.T) {
-	ha, creds := egressContainerFixture(t)
-	sts := buildEgressContainer(ha, buildStatefulSet(ha, "cfg"), creds, "h1")
+	ha := egressHA(nil)
+	sts := buildStatefulSet(ha, statefulSetInputs{
+		configHash:       "cfg",
+		egressTokenNames: []string{"GEMINI_API_KEY", "GOOGLE_API_KEY", "OPENROUTER_API_KEY"},
+		egressHash:       "h1",
+	})
 
 	agent := findHermesContainer(sts)
 	for _, name := range []string{"OPENROUTER_API_KEY", "GEMINI_API_KEY", "GOOGLE_API_KEY"} {
@@ -104,25 +116,21 @@ func TestBuildEgressContainerEnv(t *testing.T) {
 			t.Errorf("%s must come from its own egress secret key, got %s/%s", name, ref.Name, ref.Key)
 		}
 	}
-	for _, env := range agent.Env {
-		if env.ValueFrom != nil && env.ValueFrom.SecretKeyRef != nil && env.ValueFrom.SecretKeyRef.Name == egressCredsSecret {
-			t.Errorf("the agent must never reference the credentials secret, got %s", env.Name)
+	if findEnv(agent.Env, "HTTPS_PROXY") != nil {
+		t.Error("the proxy env vars belong in the .env, not the container env")
+	}
+	for _, from := range agent.EnvFrom {
+		if from.SecretRef != nil && from.SecretRef.Name == egressCredsSecret {
+			t.Error("the agent must never read the credentials secret")
 		}
 	}
-	if got := findEnv(agent.Env, "HTTPS_PROXY"); got == nil || got.Value != "http://127.0.0.1:9090" {
-		t.Errorf("unexpected HTTPS_PROXY %+v", got)
-	}
-	if got := findEnv(agent.Env, "HTTP_PROXY"); got == nil || got.Value != "http://127.0.0.1:9091" {
-		t.Errorf("unexpected HTTP_PROXY %+v", got)
-	}
 
-	proxy := findContainer(sts, egressContainerName)
+	proxy := findContainer(sts, "iron-proxy")
 	if proxy == nil {
 		t.Fatal("expected the iron-proxy sidecar")
 	}
-	gemini := findEnv(proxy.Env, "GEMINI_API_KEY")
-	if gemini == nil || gemini.ValueFrom.SecretKeyRef.Name != egressCredsSecret || gemini.ValueFrom.SecretKeyRef.Key != "GOOGLE_API_KEY" {
-		t.Errorf("expected the sidecar's GEMINI_API_KEY read from the alias key, got %+v", gemini)
+	if len(proxy.EnvFrom) != 1 || proxy.EnvFrom[0].SecretRef.Name != egressCredsSecret {
+		t.Errorf("expected the sidecar to read the credentials secret, got %+v", proxy.EnvFrom)
 	}
 	if sts.Spec.Template.Annotations[domain+"/egress-hash"] != "h1" {
 		t.Error("expected the egress hash on the pod template")
@@ -130,12 +138,13 @@ func TestBuildEgressContainerEnv(t *testing.T) {
 }
 
 func TestBuildEgressContainer(t *testing.T) {
-	ha, creds := egressContainerFixture(t)
+	ha := egressHA(nil)
+	in := statefulSetInputs{configHash: "cfg", egressTokenNames: []string{"OPENROUTER_API_KEY"}, egressHash: "h1"}
 
 	t.Run("the agent mounts the ca certificate, never its key", func(t *testing.T) {
-		sts := buildEgressContainer(ha, buildStatefulSet(ha, "cfg"), creds, "h1")
+		sts := buildStatefulSet(ha, in)
 		for _, v := range sts.Spec.Template.Spec.Volumes {
-			if v.Name != egressAgentCAVolume {
+			if v.Name != "egress-agent-ca" {
 				continue
 			}
 			for _, item := range v.Secret.Items {
@@ -151,9 +160,9 @@ func TestBuildEgressContainer(t *testing.T) {
 	t.Run("a user-supplied ca is projected under the fixed names", func(t *testing.T) {
 		withCA := ha.DeepCopy()
 		withCA.Spec.Egress.CA = &agentsv1alpha1.EgressCA{SecretRef: &agentsv1alpha1.EgressSecretRef{Name: "cm-ca"}}
-		sts := buildEgressContainer(withCA, buildStatefulSet(withCA, "cfg"), creds, "h1")
+		sts := buildStatefulSet(withCA, in)
 		for _, v := range sts.Spec.Template.Spec.Volumes {
-			if v.Name != egressConfigVolume {
+			if v.Name != "egress-config" {
 				continue
 			}
 			ca := v.Projected.Sources[1].Secret
@@ -167,9 +176,8 @@ func TestBuildEgressContainer(t *testing.T) {
 	})
 
 	t.Run("disabled egress leaves the statefulset untouched", func(t *testing.T) {
-		off := minimalHA()
-		sts := buildEgressContainer(off, buildStatefulSet(off, "cfg"), nil, "")
-		if findContainer(sts, egressContainerName) != nil || findEnv(findHermesContainer(sts).Env, "HTTPS_PROXY") != nil {
+		sts := buildStatefulSet(minimalHA(), in)
+		if findContainer(sts, "iron-proxy") != nil || findEnv(findHermesContainer(sts).Env, "OPENROUTER_API_KEY") != nil {
 			t.Error("expected no egress wiring")
 		}
 	})
