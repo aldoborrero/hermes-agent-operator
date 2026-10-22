@@ -344,7 +344,9 @@ spec:
                         type: object
                     type: object
                   config:
-                    description: Config mirrors hermes-agent's `proxy` config section.
+                    description: |-
+                      Config tunes the proxy. Its fields follow hermes-agent's `proxy` config
+                      section, except ExtraSecrets, which hermes-agent does not have.
                     properties:
                       extraAllowedHosts:
                         description: |-
@@ -357,7 +359,7 @@ spec:
                       extraSecrets:
                         description: |-
                           ExtraSecrets are swapped on top of the bundled providers. An entry named
-                          like a bundled provider replaces it.
+                          like a bundled provider replaces it. hermes-agent has no equivalent.
                         items:
                           description: EgressSecret maps a credential to the upstream
                             hosts it is swapped on.

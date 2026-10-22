@@ -92,7 +92,7 @@ var egressProviders = []EgressSecret{
 	},
 }
 
-// Egress configures an iron-proxy egress sidecar, mirroring hermes-agent's
+// Egress configures an iron-proxy egress sidecar, modelled on hermes-agent's
 // `proxy` config (`hermes egress`). The agent holds opaque proxy tokens instead
 // of its provider API keys; iron-proxy, which alone holds the real keys,
 // swaps each token for its key on the way out and denies every host not on
@@ -129,7 +129,8 @@ type Egress struct {
 	// and preserves a self-signed CA.
 	// +optional
 	CA *EgressCA `json:"ca,omitempty"`
-	// Config mirrors hermes-agent's `proxy` config section.
+	// Config tunes the proxy. Its fields follow hermes-agent's `proxy` config
+	// section, except ExtraSecrets, which hermes-agent does not have.
 	// +optional
 	Config *EgressConfig `json:"config,omitempty"`
 }
@@ -161,7 +162,10 @@ type EgressCA struct {
 	SecretRef *EgressSecretRef `json:"secretRef,omitempty"`
 }
 
-// EgressConfig mirrors hermes-agent's `proxy` config section.
+// EgressConfig tunes the proxy. TunnelPort, UpstreamDenyCIDRs and
+// ExtraAllowedHosts follow hermes-agent's `proxy` config section.
+// ExtraSecrets is an operator extension: hermes-agent swaps only its bundled
+// providers.
 type EgressConfig struct {
 	// TunnelPort is the port of iron-proxy's CONNECT tunnel listener, which the
 	// agent's HTTPS_PROXY points at. Its plain-HTTP listener, which HTTP_PROXY
@@ -183,7 +187,7 @@ type EgressConfig struct {
 	// +optional
 	ExtraAllowedHosts []string `json:"extraAllowedHosts,omitempty"`
 	// ExtraSecrets are swapped on top of the bundled providers. An entry named
-	// like a bundled provider replaces it.
+	// like a bundled provider replaces it. hermes-agent has no equivalent.
 	// +listType=map
 	// +listMapKey=name
 	// +optional
