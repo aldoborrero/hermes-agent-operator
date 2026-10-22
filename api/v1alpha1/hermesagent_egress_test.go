@@ -199,3 +199,56 @@ func TestHermesAgent_ValidateEgressSecretRefs(t *testing.T) {
 		})
 	}
 }
+
+func TestHermesAgent_ValidateEgressPorts(t *testing.T) {
+	port := func(p int32) *int32 { return &p }
+	tests := []struct {
+		name       string
+		tunnelPort *int32
+		mutate     func(*HermesAgent)
+		wantErr    bool
+	}{
+		{name: "defaults with every sidecar on", mutate: func(h *HermesAgent) {
+			h.Spec.SearXNG = &SearXNG{Enabled: true}
+			h.Spec.Camofox = &Camofox{Enabled: true}
+		}},
+		{name: "tunnel on the searxng port", tunnelPort: port(8080), wantErr: true, mutate: func(h *HermesAgent) {
+			h.Spec.SearXNG = &SearXNG{Enabled: true}
+		}},
+		{name: "plain http listener on the searxng port", tunnelPort: port(8079), wantErr: true, mutate: func(h *HermesAgent) {
+			h.Spec.SearXNG = &SearXNG{Enabled: true}
+		}},
+		{name: "searxng port while searxng is off", tunnelPort: port(8080)},
+		{name: "tunnel on the camofox port", tunnelPort: port(9377), wantErr: true, mutate: func(h *HermesAgent) {
+			h.Spec.Camofox = &Camofox{Enabled: true}
+		}},
+		{name: "api server on the default tunnel port", wantErr: true, mutate: func(h *HermesAgent) {
+			h.Spec.Hermes = &Hermes{Config: &HermesConfig{APIServer: &HermesAPIServer{Enabled: true, Port: port(9090)}}}
+		}},
+		{name: "webhook on the default plain http port", wantErr: true, mutate: func(h *HermesAgent) {
+			h.Spec.Hermes = &Hermes{Config: &HermesConfig{Webhook: &HermesWebhook{Enabled: true, Port: port(9091)}}}
+		}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ha := egressAgent()
+			ha.Spec.Egress.Config.TunnelPort = tt.tunnelPort
+			if tt.mutate != nil {
+				tt.mutate(ha)
+			}
+			if err := ha.ValidateEgressPorts(); (err != nil) != tt.wantErr {
+				t.Errorf("got error %v, expected error: %v", err, tt.wantErr)
+			}
+		})
+	}
+
+	t.Run("disabled egress claims no port", func(t *testing.T) {
+		ha := egressAgent()
+		ha.Spec.Egress.Enabled = false
+		ha.Spec.SearXNG = &SearXNG{Enabled: true}
+		ha.Spec.Egress.Config.TunnelPort = port(8080)
+		if err := ha.ValidateEgressPorts(); err != nil {
+			t.Errorf("expected no error, got %v", err)
+		}
+	})
+}

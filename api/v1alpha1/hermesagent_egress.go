@@ -18,7 +18,9 @@ package v1alpha1
 
 import (
 	"fmt"
+	"net/url"
 	"slices"
+	"strconv"
 	"strings"
 
 	corev1 "k8s.io/api/core/v1"
@@ -108,6 +110,12 @@ type Egress struct {
 	// Resources specifies compute resources for the iron-proxy container.
 	// +optional
 	Resources *corev1.ResourceRequirements `json:"resources,omitempty"`
+	// Env specifies additional environment variables for the iron-proxy
+	// sidecar container, set after the credentials Secret. iron-proxy reads
+	// IRON_* variables as overrides of its rendered config, e.g. IRON_LOG_LEVEL.
+	// Overriding a listener can expose the proxy outside the pod.
+	// +optional
+	Env []corev1.EnvVar `json:"env,omitempty"`
 	// Credentials names the Secret holding the real provider API keys, keyed by
 	// env var name (e.g. ANTHROPIC_API_KEY). Only the iron-proxy sidecar reads
 	// it. Every key naming a provider hermes-agent knows, and every
@@ -239,6 +247,15 @@ func (e *Egress) GetResources() corev1.ResourceRequirements {
 		return corev1.ResourceRequirements{}
 	}
 	return *e.Resources
+}
+
+// GetEnv returns the additional environment variables for the iron-proxy
+// container.
+func (e *Egress) GetEnv() []corev1.EnvVar {
+	if e == nil {
+		return nil
+	}
+	return e.Env
 }
 
 // GetCredentialsSecretName returns the name of the credentials Secret, or ""
@@ -484,4 +501,49 @@ func (h *HermesAgent) ValidateEgressSecretRefs() error {
 		return fmt.Errorf("egress CA Secret %q collides with a Secret the operator manages", ca)
 	}
 	return nil
+}
+
+// ValidateEgressPorts rejects a tunnel port whose listeners (TunnelPort and
+// TunnelPort+1) clash with a listener the operator configures in the pod:
+// SearXNG, Camofox, the API server or the webhook. They all share the pod's
+// network namespace, so a clash makes one of the containers fail to start.
+// Ports of user-supplied sidecars are not checked.
+func (h *HermesAgent) ValidateEgressPorts() error {
+	e := h.GetEgress()
+	if !e.IsEnabled() {
+		return nil
+	}
+	used := map[int32]string{}
+	if h.GetSearXNG().IsEnabled() {
+		used[urlPort(SearXNGURL)] = "the SearXNG sidecar"
+	}
+	if h.GetCamofox().IsEnabled() {
+		used[urlPort(CamofoxURL)] = "the Camofox sidecar"
+	}
+	if api := h.GetHermes().GetAPIServer(); api.IsEnabled() {
+		used[api.GetPort()] = "the API server"
+	}
+	if webhook := h.GetHermes().GetWebhook(); webhook.IsEnabled() {
+		used[webhook.GetPort()] = "the webhook"
+	}
+	for _, port := range []int32{e.GetTunnelPort(), e.GetTunnelPort() + 1} {
+		if owner, taken := used[port]; taken {
+			return fmt.Errorf("egress tunnelPort %d needs ports %d and %d, and %s listens on %d",
+				e.GetTunnelPort(), e.GetTunnelPort(), e.GetTunnelPort()+1, owner, port)
+		}
+	}
+	return nil
+}
+
+// urlPort returns the port of an in-pod sidecar URL.
+func urlPort(raw string) int32 {
+	u, err := url.Parse(raw)
+	if err != nil {
+		return 0
+	}
+	port, err := strconv.ParseInt(u.Port(), 10, 32)
+	if err != nil {
+		return 0
+	}
+	return int32(port)
 }

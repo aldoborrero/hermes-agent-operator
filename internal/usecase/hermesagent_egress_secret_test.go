@@ -112,6 +112,19 @@ func TestReconcileEgressSecret(t *testing.T) {
 		}
 	})
 
+	t.Run("refuses a tunnel port another listener in the pod uses", func(t *testing.T) {
+		port := int32(8080)
+		ha := egressHA(&agentsv1alpha1.EgressConfig{TunnelPort: &port})
+		ha.Spec.SearXNG = &agentsv1alpha1.SearXNG{Enabled: true}
+		kube := newFakeEgressKube(map[string]*corev1.Secret{egressCredsSecret: credsSecret("OPENROUTER_API_KEY")})
+		if _, err := NewHermesAgentUseCase(kube, silentTelemetry{}).reconcileEgressSecret(context.Background(), ha); err == nil {
+			t.Fatal("expected an error")
+		}
+		if kube.secrets[ha.GetEgressSecretName()] != nil {
+			t.Error("expected no egress secret before the port is fixed")
+		}
+	})
+
 	t.Run("fails while the credentials secret is missing", func(t *testing.T) {
 		kube := newFakeEgressKube(nil)
 		if _, err := NewHermesAgentUseCase(kube, silentTelemetry{}).reconcileEgressSecret(context.Background(), egressHA(nil)); err == nil {

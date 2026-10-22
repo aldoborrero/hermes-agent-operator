@@ -163,6 +163,7 @@ func buildEgressContainer(ha *agentsv1alpha1.HermesAgent, sts *appsv1.StatefulSe
 		ImagePullPolicy: corev1.PullIfNotPresent,
 		Args:            []string{"-config", agentsv1alpha1.EgressConfigDir + "/" + agentsv1alpha1.EgressProxyConfigKey},
 		EnvFrom:         envFrom,
+		Env:             eg.GetEnv(),
 		Resources:       eg.GetResources(),
 		SecurityContext: buildEgressContainerSecurityContext(),
 		VolumeMounts: []corev1.VolumeMount{

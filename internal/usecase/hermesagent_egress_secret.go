@@ -76,6 +76,9 @@ func (u *HermesAgentUseCase) reconcileEgressSecret(ctx context.Context, ha *agen
 		return u.recordEgressSecret(ctx, ha, "")
 	}
 
+	if err := ha.ValidateEgressPorts(); err != nil {
+		return ctrl.Result{RequeueAfter: 30 * time.Second}, err
+	}
 	creds, err := u.resolveEgressCredentials(ctx, ha)
 	if err != nil {
 		return ctrl.Result{RequeueAfter: 30 * time.Second}, err

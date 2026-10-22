@@ -100,6 +100,7 @@ func TestEgressPodInputs(t *testing.T) {
 // sidecar gets the real keys.
 func TestBuildEgressContainerEnv(t *testing.T) {
 	ha := egressHA(nil)
+	ha.Spec.Egress.Env = []corev1.EnvVar{{Name: "IRON_LOG_LEVEL", Value: "debug"}}
 	sts := buildStatefulSet(ha, statefulSetInputs{
 		configHash:       "cfg",
 		egressTokenNames: []string{"GEMINI_API_KEY", "GOOGLE_API_KEY", "OPENROUTER_API_KEY"},
@@ -131,6 +132,9 @@ func TestBuildEgressContainerEnv(t *testing.T) {
 	}
 	if len(proxy.EnvFrom) != 1 || proxy.EnvFrom[0].SecretRef.Name != egressCredsSecret {
 		t.Errorf("expected the sidecar to read the credentials secret, got %+v", proxy.EnvFrom)
+	}
+	if got := findEnv(proxy.Env, "IRON_LOG_LEVEL"); got == nil || got.Value != "debug" {
+		t.Errorf("expected the user's env on the sidecar, got %+v", proxy.Env)
 	}
 	if sts.Spec.Template.Annotations[domain+"/egress-hash"] != "h1" {
 		t.Error("expected the egress hash on the pod template")
