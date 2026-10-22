@@ -4,17 +4,16 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/json"
+	"errors"
 	"fmt"
-	agentsv1alpha1 "hermeum/hermes-agent-operator/api/v1alpha1"
 	"maps"
 	"sort"
-	"strconv"
-	"strings"
 	"time"
+
+	agentsv1alpha1 "hermeum/hermes-agent-operator/api/v1alpha1"
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
-	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/intstr"
@@ -22,17 +21,16 @@ import (
 )
 
 const (
-	hermesContainerName          = "hermes-agent"
-	hermesWorkspacePathSeparator = "--"
+	hermesContainerName = "hermes-agent"
 	// hermesHomeVolume is the StatefulSet volumeClaimTemplate name for the agent
 	// data PVC. Package-level so other reconcilers (e.g. snapshots) can share it.
 	hermesHomeVolume          = "hermes-data"
 	hermesDefaultProfile      = "default"
 	annotationDesiredSpecHash = domain + "/desired-spec-hash"
-	// searxngURL is the in-pod URL the hermes-agent uses to reach the SearXNG sidecar.
-	searxngURL = "http://localhost:8080"
-	// camofoxURL is the in-pod URL the hermes-agent uses to reach the Camofox sidecar.
-	camofoxURL = "http://localhost:9377"
+	// searxngUID/searxngGID are the uid/gid of the searxng image user
+	// (upstream container/dist.dockerfile: COPY --chown=977:977).
+	searxngUID = int64(977)
+	searxngGID = int64(977)
 )
 
 // hermesHealthCheckCommand reports the gateway state regardless of which
@@ -49,6 +47,11 @@ func (u *HermesAgentUseCase) reconcileStatefulSet(ctx context.Context, ha *agent
 
 	nsName := types.NamespacedName{Namespace: ha.Namespace, Name: ha.Name}
 
+	if ha.UsesLegacyImageForm() {
+		u.tel.Warn(ctx, "Image override uses the deprecated object form; set a plain string image reference (required in the next API version)",
+			"HermesAgent", ha.Name, "Namespace", ha.Namespace)
+	}
+
 	sts, err := u.kube.GetStatefulSet(ctx, GetStatefulSetParam{
 		NamespacedName: nsName,
 	})
@@ -56,7 +59,35 @@ func (u *HermesAgentUseCase) reconcileStatefulSet(ctx context.Context, ha *agent
 		return ctrl.Result{RequeueAfter: 30 * time.Second}, err
 	}
 
-	desired := buildStatefulSet(ha)
+	// The bootstrap ConfigMap was reconciled before this loop, so the live
+	// data matches the desired data; hashing the live object — the one the
+	// pod actually mounts — keeps the config-hash annotation truthful.
+	cmRef := ha.GetHermesConfigMapRef()
+	cm, err := u.kube.GetConfigMap(ctx, GetConfigMapParam{
+		NamespacedName: types.NamespacedName{Name: cmRef.Name, Namespace: cmRef.Namespace},
+	})
+	if err != nil {
+		return ctrl.Result{RequeueAfter: 30 * time.Second}, err
+	}
+	var cmData map[string]string
+	if cm != nil {
+		cmData = cm.Data
+	}
+	configHash := configMapDataHash(cmData)
+
+	in := statefulSetInputs{configHash: configHash}
+	if ha.GetEgress().IsEnabled() {
+		in.egressTokenNames, in.egressHash, err = u.egressPodInputs(ctx, ha)
+		if errors.Is(err, errEgressInputsPending) {
+			u.tel.Debug(ctx, "Waiting for egress Secrets", "reason", err.Error())
+			return ctrl.Result{RequeueAfter: 2 * time.Second}, nil
+		}
+		if err != nil {
+			return ctrl.Result{RequeueAfter: 30 * time.Second}, err
+		}
+	}
+
+	desired := buildStatefulSet(ha, in)
 	hash := desiredSpecHash(desired)
 	if desired.Annotations == nil {
 		desired.Annotations = map[string]string{}
@@ -68,6 +99,22 @@ func (u *HermesAgentUseCase) reconcileStatefulSet(ctx context.Context, ha *agent
 	desired.Annotations[annotationDesiredSpecHash] = hash
 
 	if sts != nil {
+		// volumeClaimTemplates are immutable on an existing StatefulSet, so a
+		// change in their name set — adding, removing, or renaming storage —
+		// cannot be applied by an update: the API server rejects the whole
+		// object, including its pod-template changes, and nothing happens.
+		// Delete the StatefulSet once; the next reconcile recreates it in the
+		// desired shape. An emptyDir→PVC reshape loses nothing (the data was
+		// ephemeral); a PVC→emptyDir reshape leaves the claim in place, as the
+		// restore flow does.
+		if !sameVolumeClaimTemplateNames(sts, desired) {
+			if err := u.kube.DeleteStatefulSet(ctx, DeleteStatefulSetParam{NamespacedName: nsName}); err != nil {
+				return ctrl.Result{RequeueAfter: 30 * time.Second}, err
+			}
+			u.tel.Info(ctx, "Deleted StatefulSet to reshape storage", "HermesAgent", ha.Name, "Namespace", ha.Namespace)
+			// Requeue so the deletion settles before the StatefulSet is recreated.
+			return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
+		}
 		if sts.Annotations[annotationDesiredSpecHash] != hash {
 			pod, err := u.kube.GetPod(ctx, GetPodParam{
 				NamespacedName: types.NamespacedName{Name: ha.Name + "-0", Namespace: ha.Namespace},
@@ -102,7 +149,10 @@ func (u *HermesAgentUseCase) reconcileStatefulSet(ctx context.Context, ha *agent
 	}
 
 	ha.Status.ManagedResources.StatefulSet = ha.Name
-	ha.Status.Phase, ha.Status.Reason = u.deriveStatus(ctx, ha)
+	phase, pod := u.deriveStatus(ctx, ha)
+	initFailure := initContainerFailure(pod)
+	ha.Status.Phase, ha.Status.Reason = phase, podStatusReason(pod, initFailure)
+	u.applyInitFailedCondition(ctx, ha, initFailure)
 	// The StatefulSet loop runs after every other resource loop, so reaching
 	// this point means all managed resources reconciled. Workload readiness
 	// itself is tracked by status.phase, not by this condition.
@@ -119,72 +169,25 @@ func (u *HermesAgentUseCase) reconcileStatefulSet(ctx context.Context, ha *agent
 	return ctrl.Result{}, nil
 }
 
-func (u *HermesAgentUseCase) deriveStatus(ctx context.Context, ha *agentsv1alpha1.HermesAgent) (agentsv1alpha1.HermesAgentPhase, string) {
+// `deriveStatus` reports the agent's phase along with the `Pod` it was derived
+// from, so that a caller needing more than the phase reads one `Pod` rather
+// than fetching it again.  The `Pod` is nil when the agent is suspended, when
+// it cannot be read, and before it exists.
+func (u *HermesAgentUseCase) deriveStatus(ctx context.Context, ha *agentsv1alpha1.HermesAgent) (agentsv1alpha1.HermesAgentPhase, *corev1.Pod) {
 	if ha.IsSuspended() {
-		return agentsv1alpha1.PhaseSuspended, ""
+		return agentsv1alpha1.PhaseSuspended, nil
 	}
 	pod, err := u.kube.GetPod(ctx, GetPodParam{
 		NamespacedName: types.NamespacedName{Name: ha.Name + "-0", Namespace: ha.Namespace},
 	})
 	if err != nil {
-		return agentsv1alpha1.PhaseUnknown, ""
+		return agentsv1alpha1.PhaseUnknown, nil
 	}
 	if pod == nil {
-		return agentsv1alpha1.PhasePending, ""
+		return agentsv1alpha1.PhasePending, nil
 	}
 
-	return hermesAgentPhase(pod), hermesAgentReason(pod)
-}
-
-func hermesAgentPhase(pod *corev1.Pod) agentsv1alpha1.HermesAgentPhase {
-	switch pod.Status.Phase {
-	case corev1.PodPending:
-		return agentsv1alpha1.PhasePending
-	case corev1.PodRunning:
-		return agentsv1alpha1.PhaseRunning
-	case corev1.PodSucceeded:
-		return agentsv1alpha1.PhaseSucceeded
-	case corev1.PodFailed:
-		return agentsv1alpha1.PhaseFailed
-	default:
-		return agentsv1alpha1.PhaseUnknown
-	}
-}
-
-func hermesAgentReason(pod *corev1.Pod) string {
-	if pod.Status.Phase == corev1.PodPending {
-		for _, c := range pod.Status.Conditions {
-			if c.Type == corev1.PodScheduled && c.Status == corev1.ConditionFalse && c.Reason != "" {
-				return c.Reason
-			}
-		}
-		for _, cs := range pod.Status.InitContainerStatuses {
-			if w := cs.State.Waiting; w != nil && w.Reason != "" {
-				return w.Reason
-			}
-		}
-		return ""
-	}
-
-	for _, cs := range pod.Status.InitContainerStatuses {
-		if t := cs.State.Terminated; t != nil && t.ExitCode != 0 && t.Reason != "" {
-			return t.Reason
-		}
-		if w := cs.State.Waiting; w != nil && w.Reason != "" {
-			return w.Reason
-		}
-	}
-
-	for _, cs := range pod.Status.ContainerStatuses {
-		if w := cs.State.Waiting; w != nil && w.Reason != "" {
-			return w.Reason
-		}
-		if t := cs.LastTerminationState.Terminated; t != nil && t.ExitCode != 0 && t.Reason != "" {
-			return t.Reason
-		}
-	}
-
-	return pod.Status.Reason
+	return hermesAgentPhase(pod), pod
 }
 
 func configMapDataHash(data map[string]string) string {
@@ -217,27 +220,62 @@ func desiredSpecHash(sts *appsv1.StatefulSet) string {
 	return fmt.Sprintf("%x", h[:])[:16]
 }
 
-func buildStatefulSet(ha *agentsv1alpha1.HermesAgent) *appsv1.StatefulSet {
+// sameVolumeClaimTemplateNames reports whether the live and desired
+// StatefulSets provision their data claims through the same set of
+// volumeClaimTemplate names. The templates themselves are immutable on an
+// existing StatefulSet, so only a change in that name set requires the
+// delete-and-recreate reshape; a size change on a kept template flows through
+// the normal update path instead, where the API server applies it on clusters
+// with PVC auto-resize.
+func sameVolumeClaimTemplateNames(live, desired *appsv1.StatefulSet) bool {
+	if len(live.Spec.VolumeClaimTemplates) != len(desired.Spec.VolumeClaimTemplates) {
+		return false
+	}
+	names := make(map[string]struct{}, len(live.Spec.VolumeClaimTemplates))
+	for _, vct := range live.Spec.VolumeClaimTemplates {
+		names[vct.Name] = struct{}{}
+	}
+	for _, vct := range desired.Spec.VolumeClaimTemplates {
+		if _, ok := names[vct.Name]; !ok {
+			return false
+		}
+	}
+	return true
+}
+
+// statefulSetInputs carries what `buildStatefulSet` needs from live objects.
+// `reconcileStatefulSet` reads them so that the builder stays pure.
+type statefulSetInputs struct {
+	// configHash is the hash of the bootstrap `ConfigMap` data the pod mounts,
+	// injected as a pod template annotation so that editing the config
+	// restarts the `Pod`: the init containers read the config once, at start.
+	configHash string
+	// egressTokenNames are the env var names the egress Secret holds proxy
+	// tokens for.
+	egressTokenNames []string
+	// egressHash covers the egress inputs the pod reads only at start.
+	egressHash string
+}
+
+// `buildStatefulSet` renders the desired `StatefulSet`.
+func buildStatefulSet(ha *agentsv1alpha1.HermesAgent, in statefulSetInputs) *appsv1.StatefulSet {
 	replicas := int32(1)
 	if ha.IsSuspended() {
 		replicas = int32(0)
 	}
 
 	// The config hash annotation is used to trigger a rolling update of the StatefulSet when the config changes.
-	cm, _ := buildHermesConfigMap(ha)
-	configHash := configMapDataHash(cm.Data)
-
 	maxUnavailable := intstr.FromInt32(1)
 	sts := &appsv1.StatefulSet{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      ha.Name,
 			Namespace: ha.Namespace,
-			Labels:    resourceLabels(ha),
+			Labels:    ha.ResourceLabels(),
 		},
 		Spec: appsv1.StatefulSetSpec{
 			Replicas: &replicas,
 			Selector: &metav1.LabelSelector{
-				MatchLabels: selectorLabels(ha),
+				MatchLabels: ha.SelectorLabels(),
 			},
 			UpdateStrategy: appsv1.StatefulSetUpdateStrategy{
 				Type: appsv1.RollingUpdateStatefulSetStrategyType,
@@ -247,16 +285,19 @@ func buildStatefulSet(ha *agentsv1alpha1.HermesAgent) *appsv1.StatefulSet {
 			},
 			Template: corev1.PodTemplateSpec{
 				ObjectMeta: metav1.ObjectMeta{
-					Labels: resourceLabels(ha),
+					Labels: ha.PodTemplateLabels(),
 					Annotations: map[string]string{
-						domain + "/config-hash": configHash,
+						domain + "/config-hash": in.configHash,
 					},
 				},
 				Spec: corev1.PodSpec{
-					ServiceAccountName: ha.GetServiceAccountName(),
+					HostUsers:         ha.GetHostUsers(),
+					PriorityClassName: ha.GetPriorityClassName(),
+					RuntimeClassName:  ha.GetRuntimeClassName(),
 					SecurityContext: &corev1.PodSecurityContext{
 						SeccompProfile: &corev1.SeccompProfile{Type: corev1.SeccompProfileTypeRuntimeDefault},
 					},
+					ServiceAccountName: ha.GetServiceAccountName(),
 				},
 			},
 		},
@@ -267,6 +308,7 @@ func buildStatefulSet(ha *agentsv1alpha1.HermesAgent) *appsv1.StatefulSet {
 	sts = buildHermesContainer(ha, sts)
 	sts = buildSearXNGContainer(ha, sts)
 	sts = buildCamofoxContainer(ha, sts)
+	sts = buildEgressContainer(ha, sts, in.egressTokenNames, in.egressHash)
 
 	// additional user-provided init containers run after the operator-managed ones.
 	sts.Spec.Template.Spec.InitContainers = append(sts.Spec.Template.Spec.InitContainers, ha.GetInitContainers()...)
@@ -280,515 +322,6 @@ func buildStatefulSet(ha *agentsv1alpha1.HermesAgent) *appsv1.StatefulSet {
 	return sts
 }
 
-// buildInitContainerSecurityContext returns a security context with hermes user.
-func buildInitContainerSecurityContext() *corev1.SecurityContext {
-	// 10000 is hermes user and group ID in the official container image.
-	uid, gid := int64(10000), int64(10000)
-	rnt := true
-	ape := false
-
-	return &corev1.SecurityContext{
-		RunAsNonRoot:             &rnt,
-		RunAsUser:                &uid,
-		RunAsGroup:               &gid,
-		AllowPrivilegeEscalation: &ape,
-		Capabilities: &corev1.Capabilities{
-			Drop: []corev1.Capability{"ALL"},
-		},
-		SeccompProfile: &corev1.SeccompProfile{
-			Type: corev1.SeccompProfileTypeRuntimeDefault,
-		},
-	}
-}
-
-// buildHermesContainer populates the StatefulSet with all resources driven by the hermes spec:
-// the main hermes-agent container (env, envFrom), init containers for config and workspace,
-// and volumes/PVCs for persistence, bootstrap config, and shared memory.
-//
-//nolint:gocyclo // inherent to the breadth of init containers and volume wiring
-func buildHermesContainer(ha *agentsv1alpha1.HermesAgent, sts *appsv1.StatefulSet) *appsv1.StatefulSet {
-	const (
-		hermesHomeMount       = "/opt/data"
-		hermesDSHMVolume      = "dshm"
-		hermesDSHMMount       = "/dev/shm"
-		hermesTmpVolume       = "tmp"
-		hermesTmpMount        = "/tmp"
-		hermesBootstrapVolume = "bootstrap"
-		hermesBootstrapMount  = "/bootstrap"
-	)
-
-	initContainer := func(name, script string) corev1.Container {
-		return corev1.Container{
-			Name:            name,
-			Image:           ha.GetHermes().GetImage(),
-			ImagePullPolicy: corev1.PullIfNotPresent,
-			Command:         []string{"/bin/sh", "-ec"},
-			Args:            []string{script},
-			Env: append([]corev1.EnvVar{
-				{Name: "HERMES_HOME", Value: hermesHomeMount},
-				{Name: "HOME", Value: hermesHomeMount + "/home"},
-			}, ha.GetHermes().GetEnv()...),
-			EnvFrom:         ha.GetHermes().GetEnvFrom(),
-			SecurityContext: buildInitContainerSecurityContext(),
-			VolumeMounts: []corev1.VolumeMount{
-				{Name: hermesHomeVolume, MountPath: hermesHomeMount},
-				{Name: hermesBootstrapVolume, MountPath: hermesBootstrapMount, ReadOnly: true},
-				{Name: hermesTmpVolume, MountPath: hermesTmpMount},
-			},
-		}
-	}
-
-	sts = sts.DeepCopy()
-	sizeLimit := resource.MustParse("1Gi")
-	apiServer := ha.GetHermes().GetAPIServer()
-
-	initContainers := []corev1.Container{}
-	container := corev1.Container{
-		Name:            hermesContainerName,
-		Image:           ha.GetHermes().GetImage(),
-		ImagePullPolicy: corev1.PullIfNotPresent,
-		Args:            []string{"gateway", "run"},
-		WorkingDir:      "/opt/hermes",
-		Ports:           ha.GetHermes().GetPorts(),
-		Env: append([]corev1.EnvVar{
-			{Name: "HERMES_HOME", Value: hermesHomeMount},
-			{Name: "HOME", Value: hermesHomeMount + "/home"},
-			{Name: "PYTHONPATH", Value: hermesHomeMount + "/.python-packages"},
-			{Name: "NODE_PATH", Value: hermesHomeMount + "/.npm-packages/lib/node_modules"},
-		}, ha.GetHermes().GetEnv()...),
-		EnvFrom:   ha.GetHermes().GetEnvFrom(),
-		Resources: ha.GetHermes().GetResources(),
-		// The Hermes container intentionally starts as root so s6-overlay's /init (PID 1) can
-		// remap UID/GID and chown /opt/data before dropping to the hermes user (UID 10000)
-		// via s6-setuidgid. This prevents setting runAsNonRoot, allowPrivilegeEscalation, and readOnlyRootFilesystem.
-		// RuntimeDefault seccomp is the strongest isolation available without changing the upstream image.
-		SecurityContext: &corev1.SecurityContext{
-			SeccompProfile: &corev1.SeccompProfile{Type: corev1.SeccompProfileTypeRuntimeDefault},
-		},
-		LivenessProbe: ha.GetHermes().GetProbes().GetLiveness().GetProbe(hermesHealthCheckCommand, corev1.Probe{
-			InitialDelaySeconds: 15, PeriodSeconds: 20, TimeoutSeconds: 5, FailureThreshold: 3,
-		}),
-		ReadinessProbe: ha.GetHermes().GetProbes().GetReadiness().GetProbe(hermesHealthCheckCommand, corev1.Probe{
-			InitialDelaySeconds: 5, PeriodSeconds: 10, TimeoutSeconds: 5, FailureThreshold: 3,
-		}),
-		StartupProbe: ha.GetHermes().GetProbes().GetStartup().GetProbe(hermesHealthCheckCommand, corev1.Probe{
-			InitialDelaySeconds: 0, PeriodSeconds: 10, TimeoutSeconds: 5, FailureThreshold: 10,
-		}),
-		VolumeMounts: append([]corev1.VolumeMount{
-			{Name: hermesDSHMVolume, MountPath: hermesDSHMMount},
-			{Name: hermesHomeVolume, MountPath: hermesHomeMount},
-			{Name: hermesTmpVolume, MountPath: hermesTmpMount},
-		}, ha.GetExtraVolumeMounts()...),
-	}
-	volumes := []corev1.Volume{
-		{
-			Name: hermesDSHMVolume,
-			VolumeSource: corev1.VolumeSource{
-				EmptyDir: &corev1.EmptyDirVolumeSource{
-					Medium:    corev1.StorageMediumMemory,
-					SizeLimit: &sizeLimit,
-				},
-			},
-		},
-		{
-			Name:         hermesTmpVolume,
-			VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{}},
-		},
-		{
-			Name: hermesBootstrapVolume,
-			VolumeSource: corev1.VolumeSource{
-				ConfigMap: &corev1.ConfigMapVolumeSource{
-					LocalObjectReference: corev1.LocalObjectReference{Name: ha.GetHermesName()},
-				},
-			},
-		},
-	}
-	pvc := []corev1.PersistentVolumeClaim{}
-
-	// API server configuration
-	if apiServer.IsEnabled() {
-		container.Ports = append(container.Ports, corev1.ContainerPort{
-			Name:          apiServer.GetPortName(),
-			ContainerPort: apiServer.GetPort(),
-			Protocol:      corev1.ProtocolTCP,
-		})
-	}
-
-	// Webhook configuration
-	webhook := ha.GetHermes().GetWebhook()
-	if webhook.IsEnabled() {
-		container.Ports = append(container.Ports, corev1.ContainerPort{
-			Name:          webhook.GetPortName(),
-			ContainerPort: webhook.GetPort(),
-			Protocol:      corev1.ProtocolTCP,
-		})
-	}
-
-	// persistence: existingClaim > existingSnapshot PVC > enabled PVC > emptyDir fallback.
-	hp := ha.GetHermes().GetPersistence()
-	if ec := hp.GetExistingClaim(); ec != "" {
-		volumes = append(volumes, corev1.Volume{
-			Name: hermesHomeVolume,
-			VolumeSource: corev1.VolumeSource{
-				PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{
-					ClaimName: ec,
-				},
-			},
-		})
-	} else if es := hp.GetExistingSnapshot(); es != "" {
-		volumes = append(volumes, corev1.Volume{
-			Name: hermesHomeVolume,
-			VolumeSource: corev1.VolumeSource{
-				PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{
-					ClaimName: buildRestoredPVCName(es),
-				},
-			},
-		})
-	} else if hp != nil && hp.Enabled {
-		pvc = append(pvc, corev1.PersistentVolumeClaim{
-			ObjectMeta: metav1.ObjectMeta{Name: hermesHomeVolume},
-			Spec: corev1.PersistentVolumeClaimSpec{
-				AccessModes: []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce},
-				Resources: corev1.VolumeResourceRequirements{
-					Requests: corev1.ResourceList{
-						corev1.ResourceStorage: hp.GetSize(),
-					},
-				},
-				StorageClassName: hp.StorageClassName,
-			},
-		})
-	} else {
-		volumes = append(volumes, corev1.Volume{
-			Name:         hermesHomeVolume,
-			VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{}},
-		})
-	}
-
-	// ensures the data volume is owned by the hermes user
-	if ha.GetHermes().ShouldInitChownData() {
-		initContainers = append(initContainers, corev1.Container{
-			Name:            "init-chown-data",
-			Image:           ha.GetHermes().GetImage(),
-			ImagePullPolicy: corev1.PullIfNotPresent,
-			Command:         []string{"/bin/sh", "-ec"},
-			Args:            []string{"chown -R 10000:10000 /opt/data"},
-			Env: append([]corev1.EnvVar{
-				{Name: "HERMES_HOME", Value: hermesHomeMount},
-				{Name: "HOME", Value: hermesHomeMount + "/home"},
-			}, ha.GetHermes().GetEnv()...),
-			EnvFrom: ha.GetHermes().GetEnvFrom(),
-			VolumeMounts: []corev1.VolumeMount{
-				{Name: hermesHomeVolume, MountPath: hermesHomeMount},
-			},
-		})
-	}
-
-	// A single consolidated init container configures the default profile:
-	// config → workspace → dotenv → packages → plugins → skills → bundles →
-	// crons → stale-profile cleanup. Steps run in subshells so a skipped step
-	// (e.g. "packages up-to-date, exit 0") cannot abort the remaining steps.
-	//
-	// dotenv: operator-managed env vars (API_SERVER_*, WEBHOOK_*, SEARXNG_URL,
-	// CAMOFOX_URL) are stored as keys in the Hermes ConfigMap and Secret, then
-	// mounted into the init container with Items filters so the existing
-	// `for f in .../*` loop dumps them as KEY=VALUE lines — the same mechanism
-	// as user workspace.dotEnv. Operator mounts come first so user dotEnv keys
-	// override on collision (user wins).
-	var defaultSteps []string
-	var defaultMounts []corev1.VolumeMount
-
-	// config: copy config.yaml from the bootstrap ConfigMap to the data volume.
-	if ha.GetHermes().GetConfig() != nil {
-		defaultSteps = append(defaultSteps, buildConfigScript(hermesDefaultProfile))
-	}
-
-	// workspace: copy workspace files from the bootstrap ConfigMap.
-	// ConfigMap keys use the format "profile.default.workspace.<path>" with "/" replaced by "--".
-	defaultSteps = append(defaultSteps, buildWorkspaceScript(hermesDefaultProfile))
-
-	// dotenv: write the default profile .env.
-	de := ha.GetHermes().GetWorkspace().GetDotEnv()
-	operatorItems := buildOperatorDotEnvItems(ha)
-	operatorSecretItems := buildOperatorDotEnvSecretItems(ha)
-	if de != nil || len(operatorItems) > 0 || len(operatorSecretItems) > 0 {
-		var mountPaths []string
-		var mounts []corev1.VolumeMount
-
-		// Operator-managed volumes first (user keys override on collision).
-		if len(operatorItems) > 0 {
-			const dotenvConfigMapVolume = "hermes-operator-dotenv-configmap"
-			const dotenvConfigMapMount = "/hermes-operator-dotenv-configmap"
-			volumes = append(volumes, corev1.Volume{
-				Name: dotenvConfigMapVolume,
-				VolumeSource: corev1.VolumeSource{
-					ConfigMap: &corev1.ConfigMapVolumeSource{
-						LocalObjectReference: corev1.LocalObjectReference{Name: ha.GetHermesName()},
-						Items:                operatorItems,
-					},
-				},
-			})
-			mounts = append(mounts, corev1.VolumeMount{Name: dotenvConfigMapVolume, MountPath: dotenvConfigMapMount, ReadOnly: true})
-			mountPaths = append(mountPaths, dotenvConfigMapMount)
-		}
-
-		if len(operatorSecretItems) > 0 {
-			const dotenvVolume = "hermes-operator-dotenv-secret"
-			const dotenvMount = "/hermes-operator-dotenv-secret"
-			volumes = append(volumes, corev1.Volume{
-				Name: dotenvVolume,
-				VolumeSource: corev1.VolumeSource{
-					Secret: &corev1.SecretVolumeSource{
-						SecretName: ha.GetHermesName(),
-						Items:      operatorSecretItems,
-					},
-				},
-			})
-			mounts = append(mounts, corev1.VolumeMount{Name: dotenvVolume, MountPath: dotenvMount, ReadOnly: true})
-			mountPaths = append(mountPaths, dotenvMount)
-		}
-
-		if de != nil {
-			// ConfigMaps: singular first, then plural in order (last-wins on
-			// key collision; Secrets override ConfigMaps).
-			if de.ConfigMapRef != nil {
-				const dotenvConfigMapVolume = "hermes-dotenv-configmap"
-				const dotenvConfigMapMount = "/hermes-dotenv-configmap"
-				volumes = append(volumes, corev1.Volume{
-					Name: dotenvConfigMapVolume,
-					VolumeSource: corev1.VolumeSource{
-						ConfigMap: &corev1.ConfigMapVolumeSource{
-							LocalObjectReference: corev1.LocalObjectReference{Name: de.ConfigMapRef.Name},
-						},
-					},
-				})
-				mounts = append(mounts, corev1.VolumeMount{Name: dotenvConfigMapVolume, MountPath: dotenvConfigMapMount, ReadOnly: true})
-				mountPaths = append(mountPaths, dotenvConfigMapMount)
-			}
-
-			for i, ref := range de.ConfigMapRefs {
-				volName := fmt.Sprintf("hermes-dotenv-configmap-%d", i)
-				mountPath := "/hermes-dotenv-configmap-" + strconv.Itoa(i)
-				volumes = append(volumes, corev1.Volume{
-					Name: volName,
-					VolumeSource: corev1.VolumeSource{
-						ConfigMap: &corev1.ConfigMapVolumeSource{
-							LocalObjectReference: corev1.LocalObjectReference{Name: ref.Name},
-						},
-					},
-				})
-				mounts = append(mounts, corev1.VolumeMount{Name: volName, MountPath: mountPath, ReadOnly: true})
-				mountPaths = append(mountPaths, mountPath)
-			}
-
-			// Secrets: singular first, then plural in order.
-			if de.SecretRef != nil {
-				const dotenvVolume = "hermes-dotenv-secret"
-				const dotenvMount = "/hermes-dotenv-secret"
-				volumes = append(volumes, corev1.Volume{
-					Name: dotenvVolume,
-					VolumeSource: corev1.VolumeSource{
-						Secret: &corev1.SecretVolumeSource{
-							SecretName: de.SecretRef.Name,
-						},
-					},
-				})
-				mounts = append(mounts, corev1.VolumeMount{Name: dotenvVolume, MountPath: dotenvMount, ReadOnly: true})
-				mountPaths = append(mountPaths, dotenvMount)
-			}
-
-			for i, ref := range de.SecretRefs {
-				volName := fmt.Sprintf("hermes-dotenv-secret-%d", i)
-				mountPath := "/hermes-dotenv-secret-" + strconv.Itoa(i)
-				volumes = append(volumes, corev1.Volume{
-					Name: volName,
-					VolumeSource: corev1.VolumeSource{
-						Secret: &corev1.SecretVolumeSource{SecretName: ref.Name},
-					},
-				})
-				mounts = append(mounts, corev1.VolumeMount{Name: volName, MountPath: mountPath, ReadOnly: true})
-				mountPaths = append(mountPaths, mountPath)
-			}
-		}
-
-		defaultSteps = append(defaultSteps, buildDotEnvScript(hermesDefaultProfile, mountPaths...))
-		defaultMounts = mounts
-	}
-
-	// python-packages: install desired packages into $HERMES_HOME/.python-packages.
-	defaultSteps = append(defaultSteps, buildPythonPackagesScript(ha.GetHermes().GetPackages().GetPip()))
-
-	// npm-packages: install desired packages into $HERMES_HOME/.npm-packages.
-	defaultSteps = append(defaultSteps, buildNPMPackagesScript(ha.GetHermes().GetPackages().GetNpm()))
-
-	// plugins: install desired plugins and remove stale ones.
-	defaultSteps = append(defaultSteps, buildPluginsScript(hermesDefaultProfile, ha.GetHermes().GetPlugins()))
-
-	// skills: install/uninstall skills via the hermes CLI.
-	defaultSteps = append(defaultSteps, buildSkillsScript(hermesDefaultProfile, ha.GetHermes().GetSkills()))
-
-	// bundles: reconcile bundles via the hermes CLI.
-	defaultSteps = append(defaultSteps, buildBundlesScript(hermesDefaultProfile, ha.GetHermes().GetBundles()))
-
-	// crons: reconcile scheduled jobs via the hermes CLI.
-	defaultSteps = append(defaultSteps, buildCronsScript(hermesDefaultProfile, ha.GetHermes().GetCrons()))
-
-	// profiles cleanup: remove named profiles no longer desired and write the
-	// desired profiles manifest. Profile creation happens in the per-profile
-	// init containers below (after the default profile is fully configured, so
-	// --clone copies complete state).
-	profiles := ha.GetHermes().GetProfiles()
-	if len(profiles) > 0 {
-		defaultSteps = append(defaultSteps, buildProfilesCleanupScript(profiles))
-	}
-
-	initContainers = append(initContainers, func() corev1.Container {
-		ic := initContainer("init-hermes", combineInitSteps(defaultSteps...))
-		ic.VolumeMounts = append(ic.VolumeMounts, defaultMounts...)
-		return ic
-	}())
-
-	// One init container per named profile: create the profile, then configure
-	// it (config → workspace → dotenv → plugins → skills → bundles → crons).
-	sidecarItemsForProfiles := buildProfileSidecarDotEnvItems(ha)
-	for _, name := range sortedProfileNames(profiles) {
-		profile := profiles[name]
-		var steps []string
-		var profileMounts []corev1.VolumeMount
-
-		steps = append(steps, buildProfileCreationScript(name, profile.Clone))
-
-		if profile.Config.GetRaw() != nil {
-			steps = append(steps, buildConfigScript(name))
-		}
-
-		steps = append(steps, buildWorkspaceScript(name))
-
-		// dotenv: SEARXNG_URL / CAMOFOX_URL point at shared sidecars and are
-		// written to every named profile's .env. API_SERVER_* / WEBHOOK_* are
-		// intentionally excluded — they belong to the default profile's
-		// gateway.
-		if de := profile.Workspace.GetDotEnv(); de != nil || len(sidecarItemsForProfiles) > 0 {
-			var mountPaths []string
-
-			// Operator sidecar keys first (user keys override on collision).
-			if len(sidecarItemsForProfiles) > 0 {
-				volName := "hermes-operator-dotenv-profile-" + name
-				mountPath := "/hermes-operator-dotenv-profile-" + name
-				volumes = append(volumes, corev1.Volume{
-					Name: volName,
-					VolumeSource: corev1.VolumeSource{
-						ConfigMap: &corev1.ConfigMapVolumeSource{
-							LocalObjectReference: corev1.LocalObjectReference{Name: ha.GetHermesName()},
-							Items:                sidecarItemsForProfiles,
-						},
-					},
-				})
-				profileMounts = append(profileMounts, corev1.VolumeMount{Name: volName, MountPath: mountPath, ReadOnly: true})
-				mountPaths = append(mountPaths, mountPath)
-			}
-
-			if de != nil {
-				// ConfigMaps: singular first, then plural in order.
-				if de.ConfigMapRef != nil {
-					volName := "hermes-dotenv-configmap-profile-" + name
-					mountPath := "/hermes-dotenv-configmap-profile-" + name
-					volumes = append(volumes, corev1.Volume{
-						Name: volName,
-						VolumeSource: corev1.VolumeSource{
-							ConfigMap: &corev1.ConfigMapVolumeSource{
-								LocalObjectReference: corev1.LocalObjectReference{Name: de.ConfigMapRef.Name},
-							},
-						},
-					})
-					profileMounts = append(profileMounts, corev1.VolumeMount{Name: volName, MountPath: mountPath, ReadOnly: true})
-					mountPaths = append(mountPaths, mountPath)
-				}
-
-				for i, ref := range de.ConfigMapRefs {
-					volName := "hermes-dotenv-configmap-profile-" + name + "-" + strconv.Itoa(i)
-					mountPath := "/hermes-dotenv-configmap-profile-" + name + "-" + strconv.Itoa(i)
-					volumes = append(volumes, corev1.Volume{
-						Name: volName,
-						VolumeSource: corev1.VolumeSource{
-							ConfigMap: &corev1.ConfigMapVolumeSource{
-								LocalObjectReference: corev1.LocalObjectReference{Name: ref.Name},
-							},
-						},
-					})
-					profileMounts = append(profileMounts, corev1.VolumeMount{Name: volName, MountPath: mountPath, ReadOnly: true})
-					mountPaths = append(mountPaths, mountPath)
-				}
-
-				// Secrets: singular first, then plural in order.
-				if de.SecretRef != nil {
-					volName := "hermes-dotenv-secret-profile-" + name
-					mountPath := "/hermes-dotenv-secret-profile-" + name
-					volumes = append(volumes, corev1.Volume{
-						Name: volName,
-						VolumeSource: corev1.VolumeSource{
-							Secret: &corev1.SecretVolumeSource{SecretName: de.SecretRef.Name},
-						},
-					})
-					profileMounts = append(profileMounts, corev1.VolumeMount{Name: volName, MountPath: mountPath, ReadOnly: true})
-					mountPaths = append(mountPaths, mountPath)
-				}
-
-				for i, ref := range de.SecretRefs {
-					volName := "hermes-dotenv-secret-profile-" + name + "-" + strconv.Itoa(i)
-					mountPath := "/hermes-dotenv-secret-profile-" + name + "-" + strconv.Itoa(i)
-					volumes = append(volumes, corev1.Volume{
-						Name: volName,
-						VolumeSource: corev1.VolumeSource{
-							Secret: &corev1.SecretVolumeSource{SecretName: ref.Name},
-						},
-					})
-					profileMounts = append(profileMounts, corev1.VolumeMount{Name: volName, MountPath: mountPath, ReadOnly: true})
-					mountPaths = append(mountPaths, mountPath)
-				}
-			}
-
-			steps = append(steps, buildDotEnvScript(name, mountPaths...))
-		}
-
-		steps = append(steps, buildPluginsScript(name, profile.Plugins))
-		steps = append(steps, buildSkillsScript(name, profile.Skills))
-		steps = append(steps, buildBundlesScript(name, profile.Bundles))
-		steps = append(steps, buildCronsScript(name, profile.Crons))
-
-		ic := initContainer("init-profile-"+name, combineInitSteps(steps...))
-		ic.VolumeMounts = append(ic.VolumeMounts, profileMounts...)
-		initContainers = append(initContainers, ic)
-	}
-
-	// initScripts: user-provided scripts run as init containers after all managed ones.
-	for _, is := range ha.GetHermes().GetInitScripts() {
-		initContainers = append(initContainers, corev1.Container{
-			Name:            is.Name,
-			Image:           ha.GetHermes().GetImage(),
-			ImagePullPolicy: corev1.PullIfNotPresent,
-			Command:         []string{"/bin/sh", "-ec"},
-			Args:            []string{is.Script},
-			Env: append([]corev1.EnvVar{
-				{Name: "HERMES_HOME", Value: hermesHomeMount},
-				{Name: "HOME", Value: hermesHomeMount + "/home"},
-			}, ha.GetHermes().GetEnv()...),
-			EnvFrom:         ha.GetHermes().GetEnvFrom(),
-			SecurityContext: buildInitContainerSecurityContext(),
-			VolumeMounts: []corev1.VolumeMount{
-				{Name: hermesHomeVolume, MountPath: hermesHomeMount},
-				{Name: hermesTmpVolume, MountPath: hermesTmpMount},
-			},
-		})
-	}
-
-	sts.Spec.Template.Spec.InitContainers = append(sts.Spec.Template.Spec.InitContainers, initContainers...)
-	sts.Spec.Template.Spec.Containers = append(sts.Spec.Template.Spec.Containers, container)
-	sts.Spec.Template.Spec.Volumes = append(sts.Spec.Template.Spec.Volumes, volumes...)
-	sts.Spec.VolumeClaimTemplates = append(sts.Spec.VolumeClaimTemplates, pvc...)
-
-	return sts
-}
-
 func findContainer(sts *appsv1.StatefulSet, name string) *corev1.Container {
 	for i := range sts.Spec.Template.Spec.Containers {
 		if sts.Spec.Template.Spec.Containers[i].Name == name {
@@ -796,757 +329,4 @@ func findContainer(sts *appsv1.StatefulSet, name string) *corev1.Container {
 		}
 	}
 	return nil
-}
-
-// buildSearXNGContainerSecurityContext returns a hardened security context for the SearXNG container.
-// The image runs as UID/GID 977 (defined via --chown=977:977 in the Dockerfile).
-func buildSearXNGContainerSecurityContext() *corev1.SecurityContext {
-	ape := false
-	rot := true
-	uid := int64(977)
-	gid := int64(977)
-	return &corev1.SecurityContext{
-		AllowPrivilegeEscalation: &ape,
-		RunAsNonRoot:             &rot,
-		RunAsUser:                &uid,
-		RunAsGroup:               &gid,
-		Capabilities: &corev1.Capabilities{
-			Drop: []corev1.Capability{"ALL"},
-		},
-		SeccompProfile: &corev1.SeccompProfile{
-			Type: corev1.SeccompProfileTypeRuntimeDefault,
-		},
-	}
-}
-
-func buildSearXNGContainer(ha *agentsv1alpha1.HermesAgent, sts *appsv1.StatefulSet) *appsv1.StatefulSet {
-	sts = sts.DeepCopy()
-
-	sx := ha.GetSearXNG()
-	if !sx.IsEnabled() {
-		return sts
-	}
-
-	const (
-		searxngContainerName   = "searxng"
-		searxngPortName        = "searxng"
-		searxngPort            = int32(8080)
-		searxngConfigVolume    = "searxng-config"
-		searxngConfigMount     = "/etc/searxng"
-		searxngBootstrapVolume = "searxng-bootstrap"
-		searxngBootstrapMount  = "/bootstrap-searxng"
-		searxngCacheVolume     = "searxng-cache"
-		searxngCacheMount      = "/var/cache/searxng"
-	)
-
-	// Inject SEARXNG_URL into the hermes-agent container env so that the web_search tool can find it.
-	if c := findContainer(sts, hermesContainerName); c != nil {
-		c.Env = append(c.Env, corev1.EnvVar{Name: "SEARXNG_URL", Value: searxngURL})
-	}
-
-	// init container: copy config files from the read-only ConfigMap bootstrap volume into the
-	// writable emptyDir at /etc/searxng so SearXNG can write runtime files alongside them.
-	sts.Spec.Template.Spec.InitContainers = append(sts.Spec.Template.Spec.InitContainers, corev1.Container{
-		Name:            "init-searxng-config",
-		Image:           sx.GetImage(),
-		ImagePullPolicy: corev1.PullIfNotPresent,
-		Command:         []string{"/bin/sh", "-ec"},
-		Args:            []string{"cp -r /bootstrap-searxng/. /etc/searxng/"},
-		VolumeMounts: []corev1.VolumeMount{
-			{Name: searxngBootstrapVolume, MountPath: searxngBootstrapMount, ReadOnly: true},
-			{Name: searxngConfigVolume, MountPath: searxngConfigMount},
-		},
-		SecurityContext: buildSearXNGContainerSecurityContext(),
-	})
-
-	sts.Spec.Template.Spec.Containers = append(sts.Spec.Template.Spec.Containers, corev1.Container{
-		Name:            searxngContainerName,
-		Image:           sx.GetImage(),
-		ImagePullPolicy: corev1.PullIfNotPresent,
-		Ports: []corev1.ContainerPort{
-			{Name: searxngPortName, ContainerPort: searxngPort, Protocol: corev1.ProtocolTCP},
-		},
-		Env: append([]corev1.EnvVar{
-			{Name: "SEARXNG_BASE_URL", Value: searxngURL + "/"},
-			{
-				Name: "SEARXNG_SECRET",
-				ValueFrom: &corev1.EnvVarSource{
-					SecretKeyRef: &corev1.SecretKeySelector{
-						LocalObjectReference: corev1.LocalObjectReference{Name: ha.GetSearXNGName()},
-						Key:                  "SEARXNG_SECRET",
-					},
-				},
-			},
-		}, sx.GetEnv()...),
-		Resources: sx.GetResources(),
-		VolumeMounts: []corev1.VolumeMount{
-			{Name: searxngConfigVolume, MountPath: searxngConfigMount},
-			{Name: searxngCacheVolume, MountPath: searxngCacheMount},
-		},
-		SecurityContext: buildSearXNGContainerSecurityContext(),
-	})
-
-	sts.Spec.Template.Spec.Volumes = append(sts.Spec.Template.Spec.Volumes,
-		corev1.Volume{
-			// writable emptyDir that holds the copied config files at runtime.
-			Name:         searxngConfigVolume,
-			VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{}},
-		},
-		corev1.Volume{
-			// read-only ConfigMap source, copied into searxng-config by the init container.
-			Name: searxngBootstrapVolume,
-			VolumeSource: corev1.VolumeSource{
-				ConfigMap: &corev1.ConfigMapVolumeSource{
-					LocalObjectReference: corev1.LocalObjectReference{Name: ha.GetSearXNGName()},
-				},
-			},
-		},
-	)
-
-	// cache: existingClaim > managed PVC > emptyDir fallback.
-	sp := sx.GetPersistence()
-	switch {
-	case sp.GetExistingClaim() != "":
-		sts.Spec.Template.Spec.Volumes = append(sts.Spec.Template.Spec.Volumes, corev1.Volume{
-			Name: searxngCacheVolume,
-			VolumeSource: corev1.VolumeSource{
-				PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{ClaimName: sp.GetExistingClaim()},
-			},
-		})
-	case sp.IsEnabled():
-		sts.Spec.Template.Spec.Volumes = append(sts.Spec.Template.Spec.Volumes, corev1.Volume{
-			Name: searxngCacheVolume,
-			VolumeSource: corev1.VolumeSource{
-				PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{ClaimName: ha.GetSearXNGName()},
-			},
-		})
-	default:
-		sts.Spec.Template.Spec.Volumes = append(sts.Spec.Template.Spec.Volumes, corev1.Volume{
-			Name:         searxngCacheVolume,
-			VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{}},
-		})
-	}
-
-	return sts
-}
-
-// buildCamofoxContainerSecurityContext returns a hardened security context for the Camofox container.
-// RunAsNonRoot is not set because the image is designed to run as root (data at /root/.cache/camoufox).
-func buildCamofoxContainerSecurityContext() *corev1.SecurityContext {
-	ape := false
-	return &corev1.SecurityContext{
-		AllowPrivilegeEscalation: &ape,
-		Capabilities: &corev1.Capabilities{
-			Drop: []corev1.Capability{"ALL"},
-		},
-		SeccompProfile: &corev1.SeccompProfile{
-			Type: corev1.SeccompProfileTypeRuntimeDefault,
-		},
-	}
-}
-
-func buildCamofoxContainer(ha *agentsv1alpha1.HermesAgent, sts *appsv1.StatefulSet) *appsv1.StatefulSet {
-	sts = sts.DeepCopy()
-
-	cx := ha.GetCamofox()
-	if !cx.IsEnabled() {
-		return sts
-	}
-
-	const (
-		camofoxContainerName = "camofox"
-		camofoxDataVolume    = "camofox-data"
-		camofoxDataMount     = "/root/.camofox"
-	)
-
-	// Inject CAMOFOX_URL into the hermes-agent container env so that the browser tool can find it.
-	if c := findContainer(sts, hermesContainerName); c != nil {
-		c.Env = append(c.Env, corev1.EnvVar{Name: "CAMOFOX_URL", Value: camofoxURL})
-	}
-
-	sts.Spec.Template.Spec.Containers = append(sts.Spec.Template.Spec.Containers, corev1.Container{
-		Name:            camofoxContainerName,
-		Image:           cx.GetImage(),
-		ImagePullPolicy: corev1.PullIfNotPresent,
-		Env:             cx.GetEnv(),
-		Resources:       cx.GetResources(),
-		SecurityContext: buildCamofoxContainerSecurityContext(),
-		VolumeMounts: []corev1.VolumeMount{
-			{Name: camofoxDataVolume, MountPath: camofoxDataMount},
-		},
-	})
-
-	// data: existingClaim > managed PVC > emptyDir fallback.
-	cp := cx.GetPersistence()
-	switch {
-	case cp.GetExistingClaim() != "":
-		sts.Spec.Template.Spec.Volumes = append(sts.Spec.Template.Spec.Volumes, corev1.Volume{
-			Name: camofoxDataVolume,
-			VolumeSource: corev1.VolumeSource{
-				PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{ClaimName: cp.GetExistingClaim()},
-			},
-		})
-	case cp.IsEnabled():
-		sts.Spec.Template.Spec.Volumes = append(sts.Spec.Template.Spec.Volumes, corev1.Volume{
-			Name: camofoxDataVolume,
-			VolumeSource: corev1.VolumeSource{
-				PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{ClaimName: ha.GetCamofoxName()},
-			},
-		})
-	default:
-		sts.Spec.Template.Spec.Volumes = append(sts.Spec.Template.Spec.Volumes, corev1.Volume{
-			Name:         camofoxDataVolume,
-			VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{}},
-		})
-	}
-
-	return sts
-}
-
-func buildConfigScript(profile string) string {
-	bootstrapKey := "profile." + profile + ".config.yaml"
-	return fmt.Sprintf(`set -eu
-mkdir -p "$HERMES_HOME/home"
-if [ -f "/bootstrap/%s" ]; then
-  config_path=$(hermes config path -p %q)
-  mkdir -p "$(dirname "$config_path")"
-  cp "/bootstrap/%s" "$config_path"
-  echo "Config written for profile %s"
-fi
-`, bootstrapKey, profile, bootstrapKey, profile)
-}
-
-func buildWorkspaceScript(profile string) string {
-	bootstrapPrefix := "profile." + profile + ".workspace."
-	manifestDir := "$HERMES_HOME/.hermes-agent-operator/profiles/" + profile
-	return fmt.Sprintf(`set -eu
-MANIFEST_FILE="%s/workspace-files"
-UPDATED_MANIFEST=""
-mkdir -p "%s"
-profile_home=$(dirname "$(hermes config path -p %q)")
-
-# delete files that were previously managed but are no longer in workspace.files
-if [ -f "$MANIFEST_FILE" ]; then
-  while IFS= read -r managed; do
-    [ -z "$managed" ] && continue
-    key="%s$(echo "$managed" | sed 's|/|%s|g')"
-    if [ ! -f "/bootstrap/$key" ]; then
-      rm -f "$profile_home/$managed"
-      echo "Removed outdated workspace file: $managed"
-    fi
-  done < "$MANIFEST_FILE"
-fi
-
-for f in /bootstrap/%s*; do
-  [ -f "$f" ] || continue
-  relpath=$(basename "$f" | sed 's/^%s//' | sed 's/%s/\//g')
-  target="$profile_home/$relpath"
-  mkdir -p "$(dirname "$target")"
-  cp "$f" "$target"
-  echo "Copied workspace file: $relpath"
-  UPDATED_MANIFEST="$UPDATED_MANIFEST$relpath
-"
-done
-
-printf '%%s' "$UPDATED_MANIFEST" > "$MANIFEST_FILE"
-`, manifestDir, manifestDir, profile,
-		bootstrapPrefix, hermesWorkspacePathSeparator,
-		bootstrapPrefix, bootstrapPrefix, hermesWorkspacePathSeparator)
-}
-
-// pluginDirName derives the plugin directory name from a Git URL or owner/repo shorthand.
-// e.g. "owner/hermes-plugin-foo" or "https://github.com/owner/hermes-plugin-foo.git" → "hermes-plugin-foo".
-func pluginDirName(identifier string) string {
-	s := strings.TrimRight(identifier, "/")
-	s = strings.TrimSuffix(s, ".git")
-	s = strings.TrimRight(s, "/")
-	if i := strings.LastIndex(s, "/"); i >= 0 {
-		return s[i+1:]
-	}
-	return s
-}
-
-func buildPluginsScript(profile string, plugins []agentsv1alpha1.HermesPlugin) string {
-	manifestDir := "$HERMES_HOME/.hermes-agent-operator/profiles/" + profile
-	desiredNames := make([]string, 0, len(plugins))
-	installLines := make([]string, 0, len(plugins))
-
-	for _, p := range plugins {
-		name := pluginDirName(p.Identifier)
-		desiredNames = append(desiredNames, name)
-
-		enableFlag := "--enable"
-		if p.Enable != nil && !*p.Enable {
-			enableFlag = "--no-enable"
-		}
-		installLines = append(installLines,
-			fmt.Sprintf("hermes plugins install -p %q --force %s %q", profile, enableFlag, p.Identifier))
-	}
-
-	// case pattern: "name1"|"name2" — safe because plugin names are GitHub repo names
-	casePattern := `"` + strings.Join(desiredNames, `"|"`) + `"`
-	installScript := strings.Join(installLines, "\n")
-	manifestContent := strings.Join(desiredNames, "\n")
-
-	return fmt.Sprintf(`set -eu
-MANIFEST="%s/plugins"
-mkdir -p "%s"
-
-# Remove plugins present in manifest but no longer desired
-if [ -f "$MANIFEST" ]; then
-  while IFS= read -r name; do
-    [ -z "$name" ] && continue
-    case "$name" in
-      %s) ;;
-      *) hermes plugins remove -p %q "$name" || true ;;
-    esac
-  done < "$MANIFEST"
-fi
-
-# Install desired plugins
-%s
-
-# Update manifest
-cat > "$MANIFEST" << 'PLUGINS_EOF'
-%s
-PLUGINS_EOF
-`, manifestDir, manifestDir, casePattern, profile, installScript, manifestContent)
-}
-
-func skillName(s agentsv1alpha1.HermesSkill) string {
-	if s.Name != "" {
-		return s.Name
-	}
-	parts := strings.Split(s.Identifier, "/")
-	return strings.TrimSuffix(parts[len(parts)-1], ".md")
-}
-
-func buildSkillsScript(profile string, skills []agentsv1alpha1.HermesSkill) string {
-	manifestDir := "$HERMES_HOME/.hermes-agent-operator/profiles/" + profile
-	desiredNames := make([]string, 0, len(skills))
-	installLines := make([]string, 0, len(skills))
-	updateLines := make([]string, 0, len(skills))
-
-	for _, s := range skills {
-		name := skillName(s)
-		desiredNames = append(desiredNames, name)
-
-		var cmd strings.Builder
-		fmt.Fprintf(&cmd, "hermes skills install -p %q --yes", profile)
-		if s.Category != "" {
-			cmd.WriteString(" --category ")
-			cmd.WriteString(s.Category)
-		}
-		if s.Name != "" {
-			cmd.WriteString(" --name ")
-			cmd.WriteString(s.Name)
-		}
-		if s.Force {
-			cmd.WriteString(" --force")
-		}
-		cmd.WriteString(" ")
-		cmd.WriteString(s.Identifier)
-		installLines = append(installLines, cmd.String())
-
-		// Pull any newer version of the skill. Idempotent: a no-op when up to date.
-		updateLines = append(updateLines, fmt.Sprintf("hermes skills update -p %q %s || true", profile, name))
-	}
-
-	casePattern := `"` + strings.Join(desiredNames, `"|"`) + `"`
-	installScript := strings.Join(installLines, "\n")
-	updateScript := strings.Join(updateLines, "\n")
-	manifestContent := strings.Join(desiredNames, "\n")
-
-	return fmt.Sprintf(`set -eu
-MANIFEST="%s/skills"
-mkdir -p "%s"
-
-# Remove skills present in manifest but no longer desired
-if [ -f "$MANIFEST" ]; then
-  while IFS= read -r name; do
-    [ -z "$name" ] && continue
-    case "$name" in
-      %s) ;;
-      *) hermes skills uninstall -p %q "$name" || true ;;
-    esac
-  done < "$MANIFEST"
-fi
-
-# Install desired skills
-%s
-
-# Update installed skills to the latest version available
-%s
-
-# Update manifest
-cat > "$MANIFEST" << 'SKILLS_EOF'
-%s
-SKILLS_EOF
-`, manifestDir, manifestDir, casePattern, profile, installScript, updateScript, manifestContent)
-}
-
-func buildBundlesScript(profile string, bundles []agentsv1alpha1.HermesBundle) string {
-	manifestDir := "$HERMES_HOME/.hermes-agent-operator/profiles/" + profile
-	desiredNames := make([]string, 0, len(bundles))
-	createLines := make([]string, 0, len(bundles))
-
-	for _, b := range bundles {
-		desiredNames = append(desiredNames, b.Name)
-
-		var cmd strings.Builder
-		fmt.Fprintf(&cmd, "hermes bundles create -p %q", profile)
-		for _, s := range b.Skills {
-			fmt.Fprintf(&cmd, " --skill %q", s)
-		}
-		if b.Description != "" {
-			fmt.Fprintf(&cmd, " --description %q", b.Description)
-		}
-		if b.Instruction != "" {
-			fmt.Fprintf(&cmd, " --instruction %q", b.Instruction)
-		}
-		if b.Force {
-			cmd.WriteString(" --force")
-		}
-		fmt.Fprintf(&cmd, " %q", b.Name)
-		// Append "|| true" to avoid failing the whole script, bundles returns non-zero exit code when the bundle already exists.
-		createLines = append(createLines, cmd.String()+" || true")
-	}
-
-	casePattern := `"` + strings.Join(desiredNames, `"|"`) + `"`
-	createScript := strings.Join(createLines, "\n")
-	manifestContent := strings.Join(desiredNames, "\n")
-
-	return fmt.Sprintf(`set -eu
-MANIFEST="%s/bundles"
-mkdir -p "%s"
-
-# Remove bundles present in manifest but no longer desired
-if [ -f "$MANIFEST" ]; then
-  while IFS= read -r name; do
-    [ -z "$name" ] && continue
-    case "$name" in
-      %s) ;;
-      *) hermes bundles delete -p %q "$name" || true ;;
-    esac
-  done < "$MANIFEST"
-fi
-
-# Create desired bundles
-%s
-
-# Update manifest
-cat > "$MANIFEST" << 'BUNDLES_EOF'
-%s
-BUNDLES_EOF
-`, manifestDir, manifestDir, casePattern, profile, createScript, manifestContent)
-}
-
-func buildPythonPackagesScript(cfg *agentsv1alpha1.HermesPipPackages) string {
-	if cfg == nil || len(cfg.Install) == 0 {
-		return "echo 'No Python packages configured'"
-	}
-
-	quoted := make([]string, len(cfg.Install))
-	for i, p := range cfg.Install {
-		quoted[i] = fmt.Sprintf("%q", p)
-	}
-
-	var extraArgs string
-	if len(cfg.ExtraArgs) > 0 {
-		quotedExtra := make([]string, len(cfg.ExtraArgs))
-		for i, a := range cfg.ExtraArgs {
-			quotedExtra[i] = fmt.Sprintf("%q", a)
-		}
-		extraArgs = " " + strings.Join(quotedExtra, " ")
-	}
-
-	installCmd := "uv pip install --python /opt/hermes/.venv/bin/python --target \"$TARGET\"" +
-		extraArgs + " " + strings.Join(quoted, " ")
-	manifestContent := strings.Join(cfg.Install, "\n")
-
-	return fmt.Sprintf(`set -eu
-TARGET="$HERMES_HOME/.python-packages"
-MANIFEST="$HERMES_HOME/.hermes-agent-operator/python-packages"
-mkdir -p "$HERMES_HOME/.hermes-agent-operator"
-
-DESIRED=$(cat <<'PKGS_EOF'
-%s
-PKGS_EOF
-)
-
-if [ -f "$MANIFEST" ] && [ "$(cat "$MANIFEST")" = "$DESIRED" ]; then
-  echo "Python packages up-to-date, skipping"
-  exit 0
-fi
-
-rm -rf "$TARGET"
-mkdir -p "$TARGET"
-%s
-
-printf '%%s' "$DESIRED" > "$MANIFEST"
-`, manifestContent, installCmd)
-}
-
-func buildNPMPackagesScript(cfg *agentsv1alpha1.HermesNpmPackages) string {
-	if cfg == nil || len(cfg.Install) == 0 {
-		return "echo 'No npm packages configured'"
-	}
-
-	quoted := make([]string, len(cfg.Install))
-	for i, p := range cfg.Install {
-		quoted[i] = fmt.Sprintf("%q", p)
-	}
-
-	installCmd := "npm install -g --prefix \"$TARGET\" " + strings.Join(quoted, " ")
-	manifestContent := strings.Join(cfg.Install, "\n")
-
-	return fmt.Sprintf(`set -eu
-TARGET="$HERMES_HOME/.npm-packages"
-MANIFEST="$HERMES_HOME/.hermes-agent-operator/npm-packages"
-mkdir -p "$HERMES_HOME/.hermes-agent-operator"
-
-DESIRED=$(cat <<'PKGS_EOF'
-%s
-PKGS_EOF
-)
-
-if [ -f "$MANIFEST" ] && [ "$(cat "$MANIFEST")" = "$DESIRED" ]; then
-  echo "npm packages up-to-date, skipping"
-  exit 0
-fi
-
-rm -rf "$TARGET"
-mkdir -p "$TARGET"
-%s
-
-printf '%%s' "$DESIRED" > "$MANIFEST"
-`, manifestContent, installCmd)
-}
-
-func buildDotEnvScript(profile string, mountPaths ...string) string {
-	var body strings.Builder
-	for _, mp := range mountPaths {
-		fmt.Fprintf(&body, `  for f in "%s"/*; do
-    [ -f "$f" ] || continue
-    key="$(basename "$f")"
-    value="$(cat "$f")"
-    printf '%%s=%%s\n' "$key" "$value"
-  done
-`, mp)
-	}
-	return fmt.Sprintf(`set -eu
-{
-%s} > "$(hermes config env-path -p %q)"
-echo "Generated .env for profile %s"
-`, body.String(), profile, profile)
-}
-
-// buildOperatorDotEnvItems returns the ConfigMap Items filter for operator-managed
-// non-secret env vars written to the default profile's .env: API_SERVER_ENABLED,
-// API_SERVER_HOST, API_SERVER_PORT, optional API_SERVER_CORS_ORIGINS,
-// WEBHOOK_ENABLED, WEBHOOK_PORT, SEARXNG_URL, CAMOFOX_URL.
-func buildOperatorDotEnvItems(ha *agentsv1alpha1.HermesAgent) []corev1.KeyToPath {
-	var items []corev1.KeyToPath
-	if apiServer := ha.GetHermes().GetAPIServer(); apiServer.IsEnabled() {
-		items = append(items,
-			corev1.KeyToPath{Key: "API_SERVER_ENABLED", Path: "API_SERVER_ENABLED"},
-			corev1.KeyToPath{Key: "API_SERVER_HOST", Path: "API_SERVER_HOST"},
-			corev1.KeyToPath{Key: "API_SERVER_PORT", Path: "API_SERVER_PORT"},
-		)
-		if origins := apiServer.GetCORSOrigins(); len(origins) > 0 {
-			items = append(items, corev1.KeyToPath{Key: "API_SERVER_CORS_ORIGINS", Path: "API_SERVER_CORS_ORIGINS"})
-		}
-	}
-	if webhook := ha.GetHermes().GetWebhook(); webhook.IsEnabled() {
-		items = append(items,
-			corev1.KeyToPath{Key: "WEBHOOK_ENABLED", Path: "WEBHOOK_ENABLED"},
-			corev1.KeyToPath{Key: "WEBHOOK_PORT", Path: "WEBHOOK_PORT"},
-		)
-	}
-	if ha.GetSearXNG().IsEnabled() {
-		items = append(items, corev1.KeyToPath{Key: "SEARXNG_URL", Path: "SEARXNG_URL"})
-	}
-	if ha.GetCamofox().IsEnabled() {
-		items = append(items, corev1.KeyToPath{Key: "CAMOFOX_URL", Path: "CAMOFOX_URL"})
-	}
-	return items
-}
-
-// buildOperatorDotEnvSecretItems returns the Secret Items filter for
-// operator-managed secret env vars written to the default profile's .env:
-// API_SERVER_KEY and/or WEBHOOK_SECRET.
-func buildOperatorDotEnvSecretItems(ha *agentsv1alpha1.HermesAgent) []corev1.KeyToPath {
-	var items []corev1.KeyToPath
-	if ha.GetHermes().GetAPIServer().IsEnabled() {
-		items = append(items, corev1.KeyToPath{Key: "API_SERVER_KEY", Path: "API_SERVER_KEY"})
-	}
-	if ha.GetHermes().GetWebhook().IsEnabled() {
-		items = append(items, corev1.KeyToPath{Key: "WEBHOOK_SECRET", Path: "WEBHOOK_SECRET"})
-	}
-	return items
-}
-
-// buildProfileSidecarDotEnvItems returns the ConfigMap Items filter for the
-// shared sidecar URLs written to every named profile's .env. API_SERVER_* and
-// WEBHOOK_* are excluded — they belong to the default profile's gateway.
-func buildProfileSidecarDotEnvItems(ha *agentsv1alpha1.HermesAgent) []corev1.KeyToPath {
-	var items []corev1.KeyToPath
-	if ha.GetSearXNG().IsEnabled() {
-		items = append(items, corev1.KeyToPath{Key: "SEARXNG_URL", Path: "SEARXNG_URL"})
-	}
-	if ha.GetCamofox().IsEnabled() {
-		items = append(items, corev1.KeyToPath{Key: "CAMOFOX_URL", Path: "CAMOFOX_URL"})
-	}
-	return items
-}
-
-func sortedProfileNames(profiles map[string]agentsv1alpha1.HermesProfile) []string {
-	names := make([]string, 0, len(profiles))
-	for name := range profiles {
-		names = append(names, name)
-	}
-	sort.Strings(names)
-	return names
-}
-
-// buildProfilesCleanupScript removes named profiles no longer desired and
-// rewrites the profiles manifest. It runs inside the consolidated init-hermes
-// container; profile creation happens in the per-profile init containers.
-func buildProfilesCleanupScript(profiles map[string]agentsv1alpha1.HermesProfile) string {
-	names := sortedProfileNames(profiles)
-	casePattern := `"` + strings.Join(names, `"|"`) + `"`
-	manifestContent := strings.Join(names, "\n")
-
-	return fmt.Sprintf(`set -eu
-PROFILES_MANIFEST="$HERMES_HOME/.hermes-agent-operator/profiles-manifest"
-mkdir -p "$HERMES_HOME/.hermes-agent-operator"
-
-if [ -f "$PROFILES_MANIFEST" ]; then
-  while IFS= read -r pname; do
-    [ -z "$pname" ] && continue
-    case "$pname" in
-      %s) ;;
-      *) hermes profile delete "$pname" || true ;;
-    esac
-  done < "$PROFILES_MANIFEST"
-fi
-
-cat > "$PROFILES_MANIFEST" << 'PROFILES_EOF'
-%s
-PROFILES_EOF
-`, casePattern, manifestContent)
-}
-
-// buildProfileCreationScript creates a single named profile. It runs as the
-// first step of the profile's own init container, after the default profile
-// has been fully configured (so --clone copies complete state).
-func buildProfileCreationScript(name string, clone bool) string {
-	cmd := fmt.Sprintf("hermes profile create %q --no-alias", name)
-	if clone {
-		cmd += " --clone"
-	}
-	return fmt.Sprintf(`set -eu
-%s || true
-echo "Profile %s ready"
-`, cmd, name)
-}
-
-// combineInitSteps joins step scripts into a single init script. Each step is
-// wrapped in a subshell so steps that exit early (e.g. "packages up-to-date,
-// exit 0") cannot abort the remaining steps, and a banner echoes the step
-// number for diagnosability.
-func combineInitSteps(steps ...string) string {
-	var s strings.Builder
-	for i, step := range steps {
-		fmt.Fprintf(&s, "echo '==> Step %d/%d'\n(\n%s\n)\n", i+1, len(steps), step)
-	}
-	return s.String()
-}
-
-func buildCronsScript(profile string, crons []agentsv1alpha1.HermesCron) string {
-	manifestDir := "$HERMES_HOME/.hermes-agent-operator/profiles/" + profile
-	desiredNames := make([]string, 0, len(crons))
-	createLines := make([]string, 0, len(crons))
-
-	var jobsPathSuffix string
-	if profile == hermesDefaultProfile {
-		jobsPathSuffix = "/cron/jobs.json"
-	} else {
-		jobsPathSuffix = "/profiles/" + profile + "/cron/jobs.json"
-	}
-
-	for _, c := range crons {
-		desiredNames = append(desiredNames, c.Name)
-
-		var cmd strings.Builder
-		fmt.Fprintf(&cmd, "hermes cron create -p %q", profile)
-		fmt.Fprintf(&cmd, " --name %q", c.Name)
-		if c.Deliver != "" {
-			fmt.Fprintf(&cmd, " --deliver %q", c.Deliver)
-		}
-		if c.Repeat != nil {
-			fmt.Fprintf(&cmd, " --repeat %d", *c.Repeat)
-		}
-		for _, s := range c.Skills {
-			fmt.Fprintf(&cmd, " --skill %q", s)
-		}
-		if c.Script != "" {
-			fmt.Fprintf(&cmd, " --script %q", c.Script)
-		}
-		if c.NoAgent {
-			cmd.WriteString(" --no-agent")
-		}
-		if c.Workdir != "" {
-			fmt.Fprintf(&cmd, " --workdir %q", c.Workdir)
-		}
-		if c.Profile != "" {
-			fmt.Fprintf(&cmd, " --profile %q", c.Profile)
-		}
-		fmt.Fprintf(&cmd, " %q", c.Schedule)
-		if c.Prompt != "" {
-			fmt.Fprintf(&cmd, " %q", c.Prompt)
-		}
-		createLines = append(createLines, cmd.String())
-	}
-
-	createScript := strings.Join(createLines, "\n")
-	manifestContent := strings.Join(desiredNames, "\n")
-
-	return fmt.Sprintf(`set -eu
-MANIFEST="%s/crons"
-mkdir -p "%s"
-
-get_job_id() {
-  python3 - "$1" <<'PY'
-import json, os, sys
-p = os.environ.get("HERMES_HOME", "/opt/data") + "%s"
-if not os.path.exists(p):
-    sys.exit(0)
-with open(p) as f:
-    data = json.load(f)
-for j in data.get("jobs", []):
-    if j.get("name") == sys.argv[1]:
-        print(j.get("id", ""))
-        break
-PY
-}
-
-# Remove crons present in manifest but no longer desired
-if [ -f "$MANIFEST" ]; then
-  while IFS= read -r name; do
-    [ -z "$name" ] && continue
-    id=$(get_job_id "$name")
-    [ -z "$id" ] && continue
-    hermes cron remove -p %q "$id" || true
-  done < "$MANIFEST"
-fi
-
-# Create desired crons
-%s
-
-# Update manifest
-cat > "$MANIFEST" << 'CRONS_EOF'
-%s
-CRONS_EOF
-`, manifestDir, manifestDir, jobsPathSuffix, profile, createScript, manifestContent)
 }

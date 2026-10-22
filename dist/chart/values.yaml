@@ -133,16 +133,16 @@ rbac:
   helpers:
     ## Install convenience admin/editor/viewer roles for CRDs
     ##
-    enable: false
+    enabled: false
 
 ## ServiceAccount configuration
 ##
 serviceAccount:
   # Install default ServiceAccount provided
-  enable: true
+  enabled: true
 
-  ## Existing ServiceAccount name (only when enable=false)
-  ## Note: When enable=true, respects nameOverride/fullnameOverride
+  ## Existing ServiceAccount name (only when enabled=false)
+  ## Note: When enabled=true, respects nameOverride/fullnameOverride
   ##
   # name: ""
 
@@ -158,7 +158,7 @@ serviceAccount:
 ##
 crd:
   # Install CRDs with the chart
-  enable: true
+  enabled: true
   # Keep CRDs when uninstalling
   keep: true
 
@@ -166,22 +166,27 @@ crd:
 ## Enable to expose /metrics endpoint
 ##
 metrics:
-  enable: true
+  enabled: true
   # Metrics server port
   port: 8443
   # Enable secure metrics: HTTPS with certs/auth (true) or HTTP (false).
   # Note: Metrics authn/authz needs ClusterRole access.
   secure: true
 
-## Cert-manager integration for TLS certificates.
-## Required for webhook certificates and metrics endpoint certificates.
+## Cert-manager integration for the metrics endpoint certificate.
+## Requires cert-manager to be installed in the cluster.
+## When enabled with metrics.enabled and metrics.secure, the chart creates a
+## self-signed `Issuer` and a `Certificate` that writes the `Secret`
+## metrics-server-cert. The manager serves that certificate, and the
+## `ServiceMonitor` uses it to verify the endpoint.
 ##
 certManager:
-  enable: false
+  enabled: false
 
 ## Prometheus ServiceMonitor for metrics scraping.
 ## Requires prometheus-operator to be installed in the cluster.
+## The `ServiceMonitor` renders only when `metrics.enabled` is also true.
 ##
 prometheus:
-  enable: false
+  enabled: false
 

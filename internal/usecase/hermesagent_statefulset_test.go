@@ -1,6 +1,8 @@
 package usecase
 
 import (
+	"context"
+	"slices"
 	"strings"
 	"testing"
 
@@ -16,9 +18,15 @@ import (
 
 const (
 	testTrue = "true"
+	// testPriorityClass is an arbitrary existing PriorityClass name used to
+	// exercise `spec.priorityClassName`.
+	testPriorityClass = "system-cluster-critical"
 	// consolidatedInitContainerName is the name of the operator-managed init
 	// container that configures the default profile.
 	consolidatedInitContainerName = "init-hermes"
+	// testConfigHash is an arbitrary fixed config hash for buildStatefulSet
+	// call sites that do not exercise the config-hash annotation itself.
+	testConfigHash = "test-config-hash"
 )
 
 func minimalHA() *agentsv1alpha1.HermesAgent {
@@ -28,11 +36,106 @@ func minimalHA() *agentsv1alpha1.HermesAgent {
 	}
 }
 
+// imageJSON wraps a raw JSON image override (string or legacy object form).
+func imageJSON(raw string) *apiextensionsv1.JSON {
+	return &apiextensionsv1.JSON{Raw: []byte(raw)}
+}
+
+func TestGetImageReferenceForms(t *testing.T) {
+	tests := []struct {
+		name string
+		raw  string
+		want string
+	}{
+		{name: "string with tag", raw: `"nousresearch/hermes-agent:v1.2.3"`, want: "nousresearch/hermes-agent:v1.2.3"},
+		{name: "string with digest", raw: `"nousresearch/hermes-agent@sha256:abc123"`, want: "nousresearch/hermes-agent@sha256:abc123"},
+		{name: "string with registry port and digest", raw: `"registry.example.com:5000/agent@sha256:abc123"`, want: "registry.example.com:5000/agent@sha256:abc123"},
+		{name: "legacy object", raw: `{"repository":"my/agent","tag":"v2"}`, want: "my/agent:v2"},
+		{name: "legacy repository only", raw: `{"repository":"my/agent"}`, want: "my/agent:latest"},
+		{name: "legacy tag only", raw: `{"tag":"v2"}`, want: "nousresearch/hermes-agent:v2"},
+		{name: "empty string", raw: `""`, want: "nousresearch/hermes-agent:latest"},
+		{name: "nil", raw: "", want: "nousresearch/hermes-agent:latest"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ha := minimalHA()
+			if tt.raw != "" {
+				ha.Spec.Hermes = &agentsv1alpha1.Hermes{Image: imageJSON(tt.raw)}
+			}
+			if got := ha.GetHermes().GetImage(); got != tt.want {
+				t.Errorf("GetImage() = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestDigestPinnedImageInPod(t *testing.T) {
+	ha := minimalHA()
+	ha.Spec.Hermes = &agentsv1alpha1.Hermes{Image: imageJSON(`"nousresearch/hermes-agent@sha256:abc123"`)}
+	sts := buildStatefulSet(ha, statefulSetInputs{configHash: testConfigHash})
+	for _, c := range sts.Spec.Template.Spec.Containers {
+		if c.Name != "hermes-agent" {
+			continue
+		}
+		if c.Image != "nousresearch/hermes-agent@sha256:abc123" {
+			t.Errorf("hermes-agent image = %q, want digest reference", c.Image)
+		}
+		return
+	}
+	t.Errorf("hermes-agent container not found in %+v", sts.Spec.Template.Spec.Containers)
+}
+
+func TestUsesLegacyImageForm(t *testing.T) {
+	t.Run("false when unset", func(t *testing.T) {
+		if minimalHA().UsesLegacyImageForm() {
+			t.Error("UsesLegacyImageForm() = true, want false")
+		}
+	})
+
+	t.Run("false when string form", func(t *testing.T) {
+		ha := minimalHA()
+		ha.Spec.Hermes = &agentsv1alpha1.Hermes{Image: imageJSON(`"nousresearch/hermes-agent:v2"`)}
+		ha.Spec.SearXNG = &agentsv1alpha1.SearXNG{Enabled: true, Image: imageJSON(`"searxng/searxng:latest"`)}
+		ha.Spec.Camofox = &agentsv1alpha1.Camofox{Enabled: true, Image: imageJSON(`"camofox:latest"`)}
+		if ha.UsesLegacyImageForm() {
+			t.Error("UsesLegacyImageForm() = true, want false")
+		}
+	})
+
+	t.Run("true when object form", func(t *testing.T) {
+		ha := minimalHA()
+		ha.Spec.Hermes = &agentsv1alpha1.Hermes{Image: imageJSON(`{"repository":"my/agent","tag":"v2"}`)}
+		if !ha.UsesLegacyImageForm() {
+			t.Error("UsesLegacyImageForm() = false, want true")
+		}
+	})
+
+	t.Run("true when sidecar object form", func(t *testing.T) {
+		ha := minimalHA()
+		ha.Spec.SearXNG = &agentsv1alpha1.SearXNG{Enabled: true, Image: imageJSON(`{"tag":"v3"}`)}
+		if !ha.UsesLegacyImageForm() {
+			t.Error("UsesLegacyImageForm() = false, want true")
+		}
+		ha = minimalHA()
+		ha.Spec.Camofox = &agentsv1alpha1.Camofox{Enabled: true, Image: imageJSON(`{"repository":"camofox"}`)}
+		if !ha.UsesLegacyImageForm() {
+			t.Error("UsesLegacyImageForm() = false, want true")
+		}
+	})
+
+	t.Run("false on nil receiver", func(t *testing.T) {
+		var ha *agentsv1alpha1.HermesAgent
+		if ha.UsesLegacyImageForm() {
+			t.Error("UsesLegacyImageForm() = true, want false")
+		}
+	})
+}
+
 func TestDesiredSpecHash(t *testing.T) {
 	t.Run("stable for identical spec", func(t *testing.T) {
 		ha := minimalHA()
-		h1 := desiredSpecHash(buildStatefulSet(ha))
-		h2 := desiredSpecHash(buildStatefulSet(ha))
+		h1 := desiredSpecHash(buildStatefulSet(ha, statefulSetInputs{configHash: testConfigHash}))
+		h2 := desiredSpecHash(buildStatefulSet(ha, statefulSetInputs{configHash: testConfigHash}))
 		if h1 != h2 {
 			t.Error("hash must be deterministic")
 		}
@@ -40,38 +143,38 @@ func TestDesiredSpecHash(t *testing.T) {
 
 	t.Run("changes when replicas change", func(t *testing.T) {
 		ha := minimalHA()
-		h1 := desiredSpecHash(buildStatefulSet(ha))
+		h1 := desiredSpecHash(buildStatefulSet(ha, statefulSetInputs{configHash: testConfigHash}))
 		suspend := true
 		ha.Spec.Suspend = &suspend
-		if desiredSpecHash(buildStatefulSet(ha)) == h1 {
+		if desiredSpecHash(buildStatefulSet(ha, statefulSetInputs{configHash: testConfigHash})) == h1 {
 			t.Error("expected different hash when replicas change")
 		}
 	})
 
 	t.Run("changes when pod template changes", func(t *testing.T) {
 		ha := minimalHA()
-		h1 := desiredSpecHash(buildStatefulSet(ha))
-		ha.Spec.Hermes = &agentsv1alpha1.Hermes{Image: &agentsv1alpha1.HermesImage{Tag: "v2"}}
-		if desiredSpecHash(buildStatefulSet(ha)) == h1 {
+		h1 := desiredSpecHash(buildStatefulSet(ha, statefulSetInputs{configHash: testConfigHash}))
+		ha.Spec.Hermes = &agentsv1alpha1.Hermes{Image: imageJSON(`"nousresearch/hermes-agent:v2"`)}
+		if desiredSpecHash(buildStatefulSet(ha, statefulSetInputs{configHash: testConfigHash})) == h1 {
 			t.Error("expected different hash when pod template changes")
 		}
 	})
 
 	t.Run("changes when volume claim templates change", func(t *testing.T) {
 		ha := minimalHA()
-		h1 := desiredSpecHash(buildStatefulSet(ha))
+		h1 := desiredSpecHash(buildStatefulSet(ha, statefulSetInputs{configHash: testConfigHash}))
 		size := resource.MustParse("10Gi")
 		ha.Spec.Hermes = &agentsv1alpha1.Hermes{Storage: &agentsv1alpha1.HermesStorage{
 			Persistence: &agentsv1alpha1.HermesPersistence{Enabled: true, Size: &size},
 		}}
-		if desiredSpecHash(buildStatefulSet(ha)) == h1 {
+		if desiredSpecHash(buildStatefulSet(ha, statefulSetInputs{configHash: testConfigHash})) == h1 {
 			t.Error("expected different hash when PVC added")
 		}
 	})
 
 	t.Run("stable when only ObjectMeta differs", func(t *testing.T) {
 		ha := minimalHA()
-		sts := buildStatefulSet(ha)
+		sts := buildStatefulSet(ha, statefulSetInputs{configHash: testConfigHash})
 		h1 := desiredSpecHash(sts)
 		sts.Labels["k8s-injected"] = testTrue
 		if desiredSpecHash(sts) != h1 {
@@ -79,12 +182,86 @@ func TestDesiredSpecHash(t *testing.T) {
 		}
 	})
 
+	t.Run("changes when hostUsers changes", func(t *testing.T) {
+		ha := minimalHA()
+		h1 := desiredSpecHash(buildStatefulSet(ha, statefulSetInputs{configHash: testConfigHash}))
+		ha.Spec.HostUsers = ptrBool(false)
+		if desiredSpecHash(buildStatefulSet(ha, statefulSetInputs{configHash: testConfigHash})) == h1 {
+			t.Error("expected different hash when hostUsers changes")
+		}
+	})
+
 	t.Run("changes when podAnnotations change", func(t *testing.T) {
 		ha := minimalHA()
-		h1 := desiredSpecHash(buildStatefulSet(ha))
+		h1 := desiredSpecHash(buildStatefulSet(ha, statefulSetInputs{configHash: testConfigHash}))
 		ha.Spec.PodAnnotations = map[string]string{"rotatedAt": "2026-07-06T12:00:00Z"}
-		if desiredSpecHash(buildStatefulSet(ha)) == h1 {
+		if desiredSpecHash(buildStatefulSet(ha, statefulSetInputs{configHash: testConfigHash})) == h1 {
 			t.Error("expected different hash when podAnnotations change")
+		}
+	})
+
+	t.Run("changes when podLabels change", func(t *testing.T) {
+		ha := minimalHA()
+		h1 := desiredSpecHash(buildStatefulSet(ha, statefulSetInputs{configHash: testConfigHash}))
+		ha.Spec.PodLabels = map[string]string{"example.com/internet-client": testTrue}
+		if desiredSpecHash(buildStatefulSet(ha, statefulSetInputs{configHash: testConfigHash})) == h1 {
+			t.Error("expected different hash when podLabels change")
+		}
+	})
+
+	t.Run("changes when runtimeClassName changes", func(t *testing.T) {
+		ha := minimalHA()
+		h1 := desiredSpecHash(buildStatefulSet(ha, statefulSetInputs{configHash: testConfigHash}))
+		ha.Spec.RuntimeClassName = ptrString("kata-qemu")
+		if desiredSpecHash(buildStatefulSet(ha, statefulSetInputs{configHash: testConfigHash})) == h1 {
+			t.Error("expected different hash when runtimeClassName changes")
+		}
+	})
+
+	t.Run("changes when priorityClassName changes", func(t *testing.T) {
+		ha := minimalHA()
+		h1 := desiredSpecHash(buildStatefulSet(ha, statefulSetInputs{configHash: testConfigHash}))
+		ha.Spec.PriorityClassName = testPriorityClass
+		if desiredSpecHash(buildStatefulSet(ha, statefulSetInputs{configHash: testConfigHash})) == h1 {
+			t.Error("expected different hash when priorityClassName changes")
+		}
+	})
+}
+
+func TestBuildStatefulSetHostUsers(t *testing.T) {
+	t.Run("unset leaves the pod in the host user namespace", func(t *testing.T) {
+		ha := minimalHA()
+		sts := buildStatefulSet(ha, statefulSetInputs{configHash: testConfigHash})
+		if got := sts.Spec.Template.Spec.HostUsers; got != nil {
+			t.Errorf("expected nil hostUsers, got %v", *got)
+		}
+	})
+
+	t.Run("false gives the pod its own user namespace", func(t *testing.T) {
+		ha := minimalHA()
+		ha.Spec.HostUsers = ptrBool(false)
+		sts := buildStatefulSet(ha, statefulSetInputs{configHash: testConfigHash})
+		got := sts.Spec.Template.Spec.HostUsers
+		if got == nil {
+			t.Fatal("expected hostUsers to be set")
+		}
+		if *got {
+			t.Error("hostUsers = true, want false")
+		}
+	})
+
+	// An explicit true is not the same as an unset field: it pins the pod to
+	// the host user namespace even if the cluster default ever changes.
+	t.Run("true is passed through rather than dropped", func(t *testing.T) {
+		ha := minimalHA()
+		ha.Spec.HostUsers = ptrBool(true)
+		sts := buildStatefulSet(ha, statefulSetInputs{configHash: testConfigHash})
+		got := sts.Spec.Template.Spec.HostUsers
+		if got == nil {
+			t.Fatal("expected hostUsers to be set")
+		}
+		if !*got {
+			t.Error("hostUsers = false, want true")
 		}
 	})
 }
@@ -92,7 +269,7 @@ func TestDesiredSpecHash(t *testing.T) {
 func TestBuildStatefulSetPodAnnotations(t *testing.T) {
 	t.Run("no extra annotations when unset", func(t *testing.T) {
 		ha := minimalHA()
-		sts := buildStatefulSet(ha)
+		sts := buildStatefulSet(ha, statefulSetInputs{configHash: testConfigHash})
 		if len(sts.Spec.Template.Annotations) != 1 {
 			t.Errorf("expected only config-hash annotation, got %v", sts.Spec.Template.Annotations)
 		}
@@ -101,7 +278,7 @@ func TestBuildStatefulSetPodAnnotations(t *testing.T) {
 	t.Run("user annotations are merged in", func(t *testing.T) {
 		ha := minimalHA()
 		ha.Spec.PodAnnotations = map[string]string{"rotatedAt": "2026-07-06T12:00:00Z", "prometheus.io/scrape": testTrue}
-		sts := buildStatefulSet(ha)
+		sts := buildStatefulSet(ha, statefulSetInputs{configHash: testConfigHash})
 		if sts.Spec.Template.Annotations["rotatedAt"] != "2026-07-06T12:00:00Z" {
 			t.Error("expected rotatedAt annotation to be present")
 		}
@@ -114,16 +291,121 @@ func TestBuildStatefulSetPodAnnotations(t *testing.T) {
 	})
 }
 
-func TestBuildStatefulSetPersistenceVolumes(t *testing.T) {
-	findVolume := func(sts *appsv1.StatefulSet) *corev1.Volume {
-		for i := range sts.Spec.Template.Spec.Volumes {
-			if sts.Spec.Template.Spec.Volumes[i].Name == hermesHomeVolume {
-				return &sts.Spec.Template.Spec.Volumes[i]
+func TestBuildStatefulSetPodLabels(t *testing.T) {
+	// selectorMatchesTemplate reports whether every selector label is present
+	// with the same value on the pod template, i.e. whether the StatefulSet can
+	// still adopt its own pods.
+	selectorMatchesTemplate := func(sts *appsv1.StatefulSet) bool {
+		for k, v := range sts.Spec.Selector.MatchLabels {
+			if sts.Spec.Template.Labels[k] != v {
+				return false
 			}
 		}
-		return nil
+		return true
 	}
 
+	t.Run("only operator labels when unset", func(t *testing.T) {
+		ha := minimalHA()
+		sts := buildStatefulSet(ha, statefulSetInputs{configHash: testConfigHash})
+		if len(sts.Spec.Template.Labels) != 3 {
+			t.Errorf("expected only the three operator labels, got %v", sts.Spec.Template.Labels)
+		}
+	})
+
+	t.Run("user labels are merged in", func(t *testing.T) {
+		ha := minimalHA()
+		ha.Spec.PodLabels = map[string]string{
+			"example.com/internet-client": testTrue,
+			"example.com/traefik-route":   testTrue,
+		}
+		sts := buildStatefulSet(ha, statefulSetInputs{configHash: testConfigHash})
+		if sts.Spec.Template.Labels["example.com/internet-client"] != testTrue {
+			t.Error("expected example.com/internet-client label to be present")
+		}
+		if sts.Spec.Template.Labels["example.com/traefik-route"] != testTrue {
+			t.Error("expected example.com/traefik-route label to be present")
+		}
+		if sts.Spec.Template.Labels[agentsv1alpha1.LabelManagedBy] != agentsv1alpha1.ManagedByValue {
+			t.Error("expected the operator labels to still be present")
+		}
+		if !selectorMatchesTemplate(sts) {
+			t.Errorf("selector %v no longer matches template labels %v",
+				sts.Spec.Selector.MatchLabels, sts.Spec.Template.Labels)
+		}
+	})
+
+	t.Run("user labels cannot shadow the selector labels", func(t *testing.T) {
+		ha := minimalHA()
+		ha.Spec.PodLabels = map[string]string{
+			agentsv1alpha1.LabelName:     "hijacked",
+			agentsv1alpha1.LabelInstance: "hijacked",
+		}
+		sts := buildStatefulSet(ha, statefulSetInputs{configHash: testConfigHash})
+		if sts.Spec.Template.Labels[agentsv1alpha1.LabelName] != agentsv1alpha1.AppNameValue {
+			t.Errorf("%s = %q, want %q", agentsv1alpha1.LabelName, sts.Spec.Template.Labels[agentsv1alpha1.LabelName], agentsv1alpha1.AppNameValue)
+		}
+		if sts.Spec.Template.Labels[agentsv1alpha1.LabelInstance] != ha.Name {
+			t.Errorf("%s = %q, want %q", agentsv1alpha1.LabelInstance, sts.Spec.Template.Labels[agentsv1alpha1.LabelInstance], ha.Name)
+		}
+		if !selectorMatchesTemplate(sts) {
+			t.Errorf("selector %v no longer matches template labels %v",
+				sts.Spec.Selector.MatchLabels, sts.Spec.Template.Labels)
+		}
+	})
+
+	t.Run("StatefulSet labels are untouched", func(t *testing.T) {
+		ha := minimalHA()
+		ha.Spec.PodLabels = map[string]string{"example.com/internet-client": testTrue}
+		sts := buildStatefulSet(ha, statefulSetInputs{configHash: testConfigHash})
+		if _, ok := sts.Labels["example.com/internet-client"]; ok {
+			t.Errorf("podLabels must not leak onto the StatefulSet, got %v", sts.Labels)
+		}
+	})
+}
+
+func TestBuildStatefulSetRuntimeClassName(t *testing.T) {
+	t.Run("unset leaves the pod on the cluster default runtime", func(t *testing.T) {
+		ha := minimalHA()
+		sts := buildStatefulSet(ha, statefulSetInputs{configHash: testConfigHash})
+		if sts.Spec.Template.Spec.RuntimeClassName != nil {
+			t.Errorf("expected nil runtimeClassName, got %q", *sts.Spec.Template.Spec.RuntimeClassName)
+		}
+	})
+
+	t.Run("set is passed through to the pod spec", func(t *testing.T) {
+		ha := minimalHA()
+		ha.Spec.RuntimeClassName = ptrString("kata-qemu-runtime-rs")
+		sts := buildStatefulSet(ha, statefulSetInputs{configHash: testConfigHash})
+		got := sts.Spec.Template.Spec.RuntimeClassName
+		if got == nil {
+			t.Fatal("expected runtimeClassName to be set")
+		}
+		if *got != "kata-qemu-runtime-rs" {
+			t.Errorf("runtimeClassName = %q, want %q", *got, "kata-qemu-runtime-rs")
+		}
+	})
+}
+
+func TestBuildStatefulSetPriorityClassName(t *testing.T) {
+	t.Run("empty when unset", func(t *testing.T) {
+		ha := minimalHA()
+		sts := buildStatefulSet(ha, statefulSetInputs{configHash: testConfigHash})
+		if got := sts.Spec.Template.Spec.PriorityClassName; got != "" {
+			t.Errorf("expected empty priorityClassName, got %q", got)
+		}
+	})
+
+	t.Run("set is passed through to the pod spec", func(t *testing.T) {
+		ha := minimalHA()
+		ha.Spec.PriorityClassName = testPriorityClass
+		sts := buildStatefulSet(ha, statefulSetInputs{configHash: testConfigHash})
+		if got := sts.Spec.Template.Spec.PriorityClassName; got != testPriorityClass {
+			t.Errorf("priorityClassName = %q, want %q", got, testPriorityClass)
+		}
+	})
+}
+
+func TestBuildStatefulSetPersistenceVolumes(t *testing.T) {
 	t.Run("existingSnapshot mounts the restored PVC explicitly", func(t *testing.T) {
 		ha := minimalHA()
 		ha.Spec.Hermes = &agentsv1alpha1.Hermes{Storage: &agentsv1alpha1.HermesStorage{
@@ -132,11 +414,11 @@ func TestBuildStatefulSetPersistenceVolumes(t *testing.T) {
 				ExistingSnapshot: ptrString("snap-1"),
 			},
 		}}
-		sts := buildStatefulSet(ha)
+		sts := buildStatefulSet(ha, statefulSetInputs{configHash: testConfigHash})
 		if len(sts.Spec.VolumeClaimTemplates) != 0 {
 			t.Error("existingSnapshot must not provision a volumeClaimTemplate")
 		}
-		vol := findVolume(sts)
+		vol := findTemplateVolume(sts)
 		if vol == nil || vol.PersistentVolumeClaim == nil || vol.PersistentVolumeClaim.ClaimName != "snap-1-restore" {
 			t.Errorf("expected explicit volume mounting snap-1-restore, got %+v", vol)
 		}
@@ -151,8 +433,8 @@ func TestBuildStatefulSetPersistenceVolumes(t *testing.T) {
 				ExistingSnapshot: ptrString("snap-1"),
 			},
 		}}
-		sts := buildStatefulSet(ha)
-		vol := findVolume(sts)
+		sts := buildStatefulSet(ha, statefulSetInputs{configHash: testConfigHash})
+		vol := findTemplateVolume(sts)
 		if vol == nil || vol.PersistentVolumeClaim == nil || vol.PersistentVolumeClaim.ClaimName != "my-claim" {
 			t.Errorf("expected existingClaim to win, got %+v", vol)
 		}
@@ -164,14 +446,263 @@ func TestBuildStatefulSetPersistenceVolumes(t *testing.T) {
 		ha.Spec.Hermes = &agentsv1alpha1.Hermes{Storage: &agentsv1alpha1.HermesStorage{
 			Persistence: &agentsv1alpha1.HermesPersistence{Enabled: true, Size: &size},
 		}}
-		sts := buildStatefulSet(ha)
+		sts := buildStatefulSet(ha, statefulSetInputs{configHash: testConfigHash})
 		if len(sts.Spec.VolumeClaimTemplates) != 1 || sts.Spec.VolumeClaimTemplates[0].Name != hermesHomeVolume {
 			t.Errorf("expected hermes-data volumeClaimTemplate, got %+v", sts.Spec.VolumeClaimTemplates)
 		}
-		if findVolume(sts) != nil {
+		if findTemplateVolume(sts) != nil {
 			t.Error("expected no explicit hermes-data volume")
 		}
 	})
+}
+
+// fakeReshapeKube is a fake Kubernetes interface for the StatefulSet storage
+// reshape tests. Only the methods touched by reconcileStatefulSet are
+// implemented; the rest are inherited from the embedded interface and panic
+// if the reconcile ever grows a new dependency, failing loudly instead of
+// silently.
+type fakeReshapeKube struct {
+	Kubernetes
+
+	sts         *appsv1.StatefulSet
+	stsCreates  int
+	stsUpdates  int
+	stsDeletes  int
+	updatedStss []*appsv1.StatefulSet
+}
+
+func (f *fakeReshapeKube) GetPod(ctx context.Context, param GetPodParam) (*corev1.Pod, error) {
+	return nil, nil
+}
+func (f *fakeReshapeKube) DeletePod(ctx context.Context, param DeletePodParam) error { return nil }
+
+func (f *fakeReshapeKube) GetConfigMap(ctx context.Context, param GetConfigMapParam) (*corev1.ConfigMap, error) {
+	return nil, nil
+}
+
+func (f *fakeReshapeKube) GetStatefulSet(ctx context.Context, param GetStatefulSetParam) (*appsv1.StatefulSet, error) {
+	return f.sts, nil
+}
+func (f *fakeReshapeKube) CreateStatefulSetOwnedByHermesAgent(ctx context.Context, param CreateStatefulSetOfHermesAgentParam) error {
+	f.stsCreates++
+	f.sts = param.StatefulSet
+	return nil
+}
+func (f *fakeReshapeKube) UpdateStatefulSetOwnedByHermesAgent(ctx context.Context, param UpdateStatefulSetParam) error {
+	f.stsUpdates++
+	f.sts = param.StatefulSet
+	f.updatedStss = append(f.updatedStss, param.StatefulSet)
+	return nil
+}
+func (f *fakeReshapeKube) DeleteStatefulSet(ctx context.Context, param DeleteStatefulSetParam) error {
+	f.stsDeletes++
+	f.sts = nil
+	return nil
+}
+
+func (f *fakeReshapeKube) UpdateHermesAgentStatus(ctx context.Context, param UpdateHermesAgentStatusParam) error {
+	return nil
+}
+
+// storageHA builds a HermesAgent with the hermes data persistence block set
+// to the given enabled state and size ("" for the default).
+func storageHA(enabled bool, size string) *agentsv1alpha1.HermesAgent {
+	ha := minimalHA()
+	p := &agentsv1alpha1.HermesPersistence{Enabled: enabled}
+	if size != "" {
+		q := resource.MustParse(size)
+		p.Size = &q
+	}
+	ha.Spec.Hermes = &agentsv1alpha1.Hermes{Storage: &agentsv1alpha1.HermesStorage{Persistence: p}}
+	return ha
+}
+
+// findTemplateVolume returns the pod-template volume for the hermes data
+// volume name, or nil when absent.
+func findTemplateVolume(sts *appsv1.StatefulSet) *corev1.Volume {
+	for i := range sts.Spec.Template.Spec.Volumes {
+		if sts.Spec.Template.Spec.Volumes[i].Name == hermesHomeVolume {
+			return &sts.Spec.Template.Spec.Volumes[i]
+		}
+	}
+	return nil
+}
+
+func assertNoReshapeOps(t *testing.T, kube *fakeReshapeKube, wantCreates, wantDeletes, wantUpdates int) {
+	t.Helper()
+	if kube.stsCreates != wantCreates {
+		t.Errorf("StatefulSet creates = %d, want %d", kube.stsCreates, wantCreates)
+	}
+	if kube.stsDeletes != wantDeletes {
+		t.Errorf("StatefulSet deletes = %d, want %d", kube.stsDeletes, wantDeletes)
+	}
+	if kube.stsUpdates != wantUpdates {
+		t.Errorf("StatefulSet updates = %d, want %d", kube.stsUpdates, wantUpdates)
+	}
+}
+
+// TestReconcileStatefulSetAddsStorage covers issue #133: adding storage to a
+// running agent must reshape (delete + recreate) the StatefulSet.
+// TestReconcileStatefulSetAddsStorage covers issue #133: adding storage to a
+// running agent must reshape (delete + recreate) the StatefulSet.
+func TestReconcileStatefulSetAddsStorage(t *testing.T) {
+	ctx := context.Background()
+	kube := &fakeReshapeKube{}
+	uc := NewHermesAgentUseCase(kube, silentTelemetry{})
+
+	// 1. Agent without persistence: the StatefulSet is created with an
+	// emptyDir hermes-data volume and no volumeClaimTemplate.
+	ha := storageHA(false, "")
+	if _, err := uc.reconcileStatefulSet(ctx, ha); err != nil {
+		t.Fatalf("initial reconcile: %v", err)
+	}
+	assertNoReshapeOps(t, kube, 1, 0, 0)
+	if len(kube.sts.Spec.VolumeClaimTemplates) != 0 {
+		t.Errorf("expected no volumeClaimTemplates, got %+v", kube.sts.Spec.VolumeClaimTemplates)
+	}
+	vol := findTemplateVolume(kube.sts)
+	if vol == nil || vol.EmptyDir == nil {
+		t.Errorf("expected hermes-data emptyDir volume, got %+v", vol)
+	}
+
+	// 2. Persistence is enabled on the running agent: the shape changed, so
+	// the StatefulSet must be deleted, not updated.
+	ha = storageHA(true, "5Gi")
+	if _, err := uc.reconcileStatefulSet(ctx, ha); err != nil {
+		t.Fatalf("reshape reconcile: %v", err)
+	}
+	assertNoReshapeOps(t, kube, 1, 1, 0)
+	if kube.sts != nil {
+		t.Errorf("expected StatefulSet to be deleted, got %+v", kube.sts)
+	}
+
+	// 3. After the deletion settles, the StatefulSet is recreated with the
+	// hermes-data volumeClaimTemplate.
+	if _, err := uc.reconcileStatefulSet(ctx, ha); err != nil {
+		t.Fatalf("recreate reconcile: %v", err)
+	}
+	assertNoReshapeOps(t, kube, 2, 1, 0)
+	if len(kube.sts.Spec.VolumeClaimTemplates) != 1 || kube.sts.Spec.VolumeClaimTemplates[0].Name != hermesHomeVolume {
+		t.Errorf("expected hermes-data volumeClaimTemplate, got %+v", kube.sts.Spec.VolumeClaimTemplates)
+	}
+	if got := kube.sts.Spec.VolumeClaimTemplates[0].Spec.Resources.Requests[corev1.ResourceStorage]; got.String() != "5Gi" {
+		t.Errorf("volumeClaimTemplate storage = %s, want 5Gi", got.String())
+	}
+	vol = findTemplateVolume(kube.sts)
+	if vol != nil {
+		t.Errorf("expected no hermes-data pod-template volume, got %+v", vol)
+	}
+	if kube.sts.Annotations[annotationDesiredSpecHash] == "" {
+		t.Error("expected desired-spec-hash annotation on the recreated StatefulSet")
+	}
+
+	// 4. No thrash: a further reconcile of the same shape and spec is a no-op.
+	if _, err := uc.reconcileStatefulSet(ctx, ha); err != nil {
+		t.Fatalf("settled reconcile: %v", err)
+	}
+	assertNoReshapeOps(t, kube, 2, 1, 0)
+}
+
+// TestReconcileStatefulSetRemovesStorage covers the symmetric reshape:
+// disabling persistence recreates the StatefulSet with the emptyDir fallback;
+// the old claim is left in place.
+func TestReconcileStatefulSetRemovesStorage(t *testing.T) {
+	ctx := context.Background()
+	kube := &fakeReshapeKube{}
+	uc := NewHermesAgentUseCase(kube, silentTelemetry{})
+
+	ha := storageHA(true, "")
+	if _, err := uc.reconcileStatefulSet(ctx, ha); err != nil {
+		t.Fatalf("initial reconcile: %v", err)
+	}
+	assertNoReshapeOps(t, kube, 1, 0, 0)
+	if len(kube.sts.Spec.VolumeClaimTemplates) != 1 {
+		t.Fatalf("expected hermes-data volumeClaimTemplate, got %+v", kube.sts.Spec.VolumeClaimTemplates)
+	}
+
+	ha = storageHA(false, "")
+	if _, err := uc.reconcileStatefulSet(ctx, ha); err != nil {
+		t.Fatalf("reshape reconcile: %v", err)
+	}
+	assertNoReshapeOps(t, kube, 1, 1, 0)
+
+	if _, err := uc.reconcileStatefulSet(ctx, ha); err != nil {
+		t.Fatalf("recreate reconcile: %v", err)
+	}
+	assertNoReshapeOps(t, kube, 2, 1, 0)
+	if len(kube.sts.Spec.VolumeClaimTemplates) != 0 {
+		t.Errorf("expected no volumeClaimTemplates, got %+v", kube.sts.Spec.VolumeClaimTemplates)
+	}
+	vol := findTemplateVolume(kube.sts)
+	if vol == nil || vol.EmptyDir == nil {
+		t.Errorf("expected hermes-data emptyDir volume, got %+v", vol)
+	}
+}
+
+// TestReconcileStatefulSetSizesStorage covers a size-only change on an
+// existing template: the name set does not change, so the StatefulSet is
+// updated in place instead of being reshaped.
+func TestReconcileStatefulSetSizesStorage(t *testing.T) {
+	ctx := context.Background()
+	kube := &fakeReshapeKube{}
+	uc := NewHermesAgentUseCase(kube, silentTelemetry{})
+
+	ha := storageHA(true, "5Gi")
+	if _, err := uc.reconcileStatefulSet(ctx, ha); err != nil {
+		t.Fatalf("initial reconcile: %v", err)
+	}
+	assertNoReshapeOps(t, kube, 1, 0, 0)
+
+	ha = storageHA(true, "10Gi")
+	if _, err := uc.reconcileStatefulSet(ctx, ha); err != nil {
+		t.Fatalf("resize reconcile: %v", err)
+	}
+	assertNoReshapeOps(t, kube, 1, 0, 1)
+	latest := kube.updatedStss[len(kube.updatedStss)-1]
+	if got := latest.Spec.VolumeClaimTemplates[0].Spec.Resources.Requests[corev1.ResourceStorage]; got.String() != "10Gi" {
+		t.Errorf("volumeClaimTemplate storage = %s, want 10Gi", got.String())
+	}
+
+	// No thrash: the updated StatefulSet carries the new hash.
+	if _, err := uc.reconcileStatefulSet(ctx, ha); err != nil {
+		t.Fatalf("settled reconcile: %v", err)
+	}
+	assertNoReshapeOps(t, kube, 1, 0, 1)
+}
+
+// TestSameVolumeClaimTemplateNames unit-tests the shape comparison directly.
+func TestSameVolumeClaimTemplateNames(t *testing.T) {
+	liveVCT := func(names ...string) []corev1.PersistentVolumeClaim {
+		vcts := make([]corev1.PersistentVolumeClaim, 0, len(names))
+		for _, name := range names {
+			vcts = append(vcts, corev1.PersistentVolumeClaim{
+				ObjectMeta: metav1.ObjectMeta{Name: name},
+			})
+		}
+		return vcts
+	}
+	tests := []struct {
+		name    string
+		live    []corev1.PersistentVolumeClaim
+		desired []corev1.PersistentVolumeClaim
+		want    bool
+	}{
+		{name: "both empty", live: nil, desired: nil, want: true},
+		{name: "same names", live: liveVCT("a", "b"), desired: liveVCT("b", "a"), want: true},
+		{name: "added template", live: liveVCT(), desired: liveVCT("a"), want: false},
+		{name: "removed template", live: liveVCT("a"), desired: liveVCT(), want: false},
+		{name: "renamed template", live: liveVCT("a"), desired: liveVCT("b"), want: false},
+		{name: "same count, one renamed", live: liveVCT("a", "b"), desired: liveVCT("a", "c"), want: false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			live := &appsv1.StatefulSet{Spec: appsv1.StatefulSetSpec{VolumeClaimTemplates: tt.live}}
+			desired := &appsv1.StatefulSet{Spec: appsv1.StatefulSetSpec{VolumeClaimTemplates: tt.desired}}
+			if got := sameVolumeClaimTemplateNames(live, desired); got != tt.want {
+				t.Errorf("sameVolumeClaimTemplateNames() = %v, want %v", got, tt.want)
+			}
+		})
+	}
 }
 
 func ptrBool(b bool) *bool       { return &b }
@@ -256,6 +787,17 @@ func TestBuildPluginsScript(t *testing.T) {
 		}
 		if !strings.Contains(got, `hermes plugins install -p "default" --force --no-enable "owner/hermes-plugin-b"`) {
 			t.Errorf("missing install command for plugin b in:\n%s", got)
+		}
+	})
+
+	t.Run("with ref pins commit sha", func(t *testing.T) {
+		got := buildPluginsScript(hermesDefaultProfile, []agentsv1alpha1.HermesPlugin{
+			{Identifier: "owner/hermes-plugin-pinned", Ref: "a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0"},
+		})
+
+		wantCmd := `hermes plugins install -p "default" --force --enable --ref "a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0" "owner/hermes-plugin-pinned"`
+		if !strings.Contains(got, wantCmd) {
+			t.Errorf("expected install command %q in script, got:\n%s", wantCmd, got)
 		}
 	})
 
@@ -576,20 +1118,45 @@ func TestBuildCronsScript(t *testing.T) {
 	t.Run("all options", func(t *testing.T) {
 		got := buildCronsScript(hermesDefaultProfile, []agentsv1alpha1.HermesCron{
 			{
-				Name:     "full",
-				Schedule: "every 2h",
-				Prompt:   "do thing",
-				Deliver:  "telegram",
-				Repeat:   ptrInt(3),
-				Skills:   []string{"alpha", "beta"},
-				Script:   "myscript.sh",
-				NoAgent:  true,
-				Workdir:  "/opt/data",
-				Profile:  "default",
+				Name:            "full",
+				Schedule:        "every 2h",
+				Prompt:          "do thing",
+				Deliver:         "telegram",
+				Repeat:          ptrInt(3),
+				Skills:          []string{"alpha", "beta"},
+				Script:          "myscript.sh",
+				NoAgent:         true,
+				Workdir:         "/opt/data",
+				MonitorScript:   "source.sh",
+				MonitorURL:      "https://example.com/status",
+				Model:           "gpt-5",
+				Provider:        "openrouter",
+				ReasoningEffort: "high",
+				Continuity:      true,
+				Profile:         "default",
 			},
 		})
 
-		wantCmd := `hermes cron create -p "default" --name "full" --deliver "telegram" --repeat 3 --skill "alpha" --skill "beta" --script "myscript.sh" --no-agent --workdir "/opt/data" --profile "default" "every 2h" "do thing"`
+		wantCmd := `hermes cron create -p "default" --name "full" --deliver "telegram" --repeat 3 --skill "alpha" --skill "beta" --script "myscript.sh" --no-agent --workdir "/opt/data" --monitor-script "source.sh" --monitor-url "https://example.com/status" --model "gpt-5" --provider "openrouter" --reasoning-effort "high" --continuity --profile "default" "every 2h" "do thing"`
+		if !strings.Contains(got, wantCmd) {
+			t.Errorf("expected:\n%s\n\nin script:\n%s", wantCmd, got)
+		}
+	})
+
+	t.Run("new params only", func(t *testing.T) {
+		got := buildCronsScript(hermesDefaultProfile, []agentsv1alpha1.HermesCron{
+			{
+				Name:            "new",
+				Schedule:        "0 9 * * *",
+				MonitorURL:      "https://example.com",
+				Model:           "claude-opus-4-5",
+				Provider:        "nous",
+				ReasoningEffort: "low",
+				Continuity:      true,
+			},
+		})
+
+		wantCmd := `hermes cron create -p "default" --name "new" --monitor-url "https://example.com" --model "claude-opus-4-5" --provider "nous" --reasoning-effort "low" --continuity "0 9 * * *"`
 		if !strings.Contains(got, wantCmd) {
 			t.Errorf("expected:\n%s\n\nin script:\n%s", wantCmd, got)
 		}
@@ -691,24 +1258,24 @@ func TestOperatorDotEnvAPIServer(t *testing.T) {
 		}
 
 		// ConfigMap must contain the operator env-var keys.
-		cm, err := buildHermesConfigMap(ha)
+		data, err := buildHermesConfigMapData(ha, resolvedConfigDocuments{})
 		if err != nil {
 			t.Fatal(err)
 		}
 		for _, key := range []string{"API_SERVER_ENABLED", "API_SERVER_HOST", "API_SERVER_PORT"} {
-			if _, ok := cm.Data[key]; !ok {
+			if _, ok := data[key]; !ok {
 				t.Errorf("expected %q in ConfigMap data", key)
 			}
 		}
-		if cm.Data["API_SERVER_ENABLED"] != testTrue {
-			t.Errorf("expected API_SERVER_ENABLED=true, got %q", cm.Data["API_SERVER_ENABLED"])
+		if data["API_SERVER_ENABLED"] != testTrue {
+			t.Errorf("expected API_SERVER_ENABLED=true, got %q", data["API_SERVER_ENABLED"])
 		}
-		if cm.Data["API_SERVER_HOST"] != "0.0.0.0" {
-			t.Errorf("expected API_SERVER_HOST=0.0.0.0, got %q", cm.Data["API_SERVER_HOST"])
+		if data["API_SERVER_HOST"] != "0.0.0.0" {
+			t.Errorf("expected API_SERVER_HOST=0.0.0.0, got %q", data["API_SERVER_HOST"])
 		}
 
 		// init-hermes must exist and mount the operator ConfigMap and Secret.
-		sts := buildStatefulSet(ha)
+		sts := buildStatefulSet(ha, statefulSetInputs{configHash: testConfigHash})
 		ic := findInitContainer(sts, consolidatedInitContainerName)
 		if ic == nil {
 			t.Fatal("expected init-hermes init container")
@@ -749,12 +1316,12 @@ func TestOperatorDotEnvAPIServer(t *testing.T) {
 				},
 			},
 		}
-		cm, err := buildHermesConfigMap(ha)
+		data, err := buildHermesConfigMapData(ha, resolvedConfigDocuments{})
 		if err != nil {
 			t.Fatal(err)
 		}
-		if cm.Data["API_SERVER_CORS_ORIGINS"] != "https://a.example,https://b.example" {
-			t.Errorf("expected CORS origins in ConfigMap, got %q", cm.Data["API_SERVER_CORS_ORIGINS"])
+		if data["API_SERVER_CORS_ORIGINS"] != "https://a.example,https://b.example" {
+			t.Errorf("expected CORS origins in ConfigMap, got %q", data["API_SERVER_CORS_ORIGINS"])
 		}
 	})
 
@@ -766,27 +1333,27 @@ func TestOperatorDotEnvAPIServer(t *testing.T) {
 				APIServer: &agentsv1alpha1.HermesAPIServer{Enabled: true, Port: &port},
 			},
 		}
-		cm, err := buildHermesConfigMap(ha)
+		data, err := buildHermesConfigMapData(ha, resolvedConfigDocuments{})
 		if err != nil {
 			t.Fatal(err)
 		}
-		if cm.Data["API_SERVER_PORT"] != "9000" {
-			t.Errorf("expected API_SERVER_PORT=9000, got %q", cm.Data["API_SERVER_PORT"])
+		if data["API_SERVER_PORT"] != "9000" {
+			t.Errorf("expected API_SERVER_PORT=9000, got %q", data["API_SERVER_PORT"])
 		}
 	})
 
 	t.Run("disabled: no operator keys in ConfigMap, no dotenv section", func(t *testing.T) {
 		ha := minimalHA()
-		cm, err := buildHermesConfigMap(ha)
+		data, err := buildHermesConfigMapData(ha, resolvedConfigDocuments{})
 		if err != nil {
 			t.Fatal(err)
 		}
 		for _, key := range []string{"API_SERVER_ENABLED", "API_SERVER_HOST", "API_SERVER_PORT"} {
-			if _, ok := cm.Data[key]; ok {
+			if _, ok := data[key]; ok {
 				t.Errorf("expected %q absent from ConfigMap when apiServer disabled", key)
 			}
 		}
-		sts := buildStatefulSet(ha)
+		sts := buildStatefulSet(ha, statefulSetInputs{configHash: testConfigHash})
 		ic := findInitContainer(sts, consolidatedInitContainerName)
 		if ic == nil {
 			t.Fatal("expected init-hermes")
@@ -805,18 +1372,18 @@ func TestOperatorDotEnvWebhook(t *testing.T) {
 		},
 	}
 
-	cm, err := buildHermesConfigMap(ha)
+	data, err := buildHermesConfigMapData(ha, resolvedConfigDocuments{})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if cm.Data["WEBHOOK_ENABLED"] != testTrue {
-		t.Errorf("expected WEBHOOK_ENABLED=true, got %q", cm.Data["WEBHOOK_ENABLED"])
+	if data["WEBHOOK_ENABLED"] != testTrue {
+		t.Errorf("expected WEBHOOK_ENABLED=true, got %q", data["WEBHOOK_ENABLED"])
 	}
-	if cm.Data["WEBHOOK_PORT"] != "8644" {
-		t.Errorf("expected WEBHOOK_PORT=8644, got %q", cm.Data["WEBHOOK_PORT"])
+	if data["WEBHOOK_PORT"] != "8644" {
+		t.Errorf("expected WEBHOOK_PORT=8644, got %q", data["WEBHOOK_PORT"])
 	}
 
-	sts := buildStatefulSet(ha)
+	sts := buildStatefulSet(ha, statefulSetInputs{configHash: testConfigHash})
 	ic := findInitContainer(sts, consolidatedInitContainerName)
 	if ic == nil {
 		t.Fatal("expected init-hermes init container")
@@ -837,20 +1404,98 @@ func TestOperatorDotEnvWebhook(t *testing.T) {
 	}
 }
 
+// TestSearXNGVolumeOwnership reproduces the ownership warnings reported in
+// issue #98: kubelet creates emptyDir/PVC volumes as root:root, but the
+// upstream searxng image entrypoint requires them to be owned by
+// searxng:searxng (uid/gid 977) and cannot fix them itself because it runs
+// non-root. The operator therefore prepares both volumes in a root-owned
+// init container step.
+func TestSearXNGVolumeOwnership(t *testing.T) {
+	ha := minimalHA()
+	ha.Spec.SearXNG = &agentsv1alpha1.SearXNG{Enabled: true}
+
+	ic := findInitContainer(buildStatefulSet(ha, statefulSetInputs{configHash: testConfigHash}), "init-searxng-config")
+	if ic == nil {
+		t.Fatal("expected init-searxng-config init container")
+	}
+
+	t.Run("volumes are chowned to the searxng user", func(t *testing.T) {
+		// The whole script must live in a single Args element: with Command
+		// ["/bin/sh","-ec"], only the first operand after -c is the script —
+		// additional Args elements become $0 and are never executed, which is
+		// how the chown originally went missing (#98).
+		if len(ic.Args) != 1 {
+			t.Fatalf("init-searxng-config args = %q, want exactly one script element", ic.Args)
+		}
+		// Literal uid/gid on purpose: catches drift of the searxngUID/GID
+		// constants away from the 977 the upstream image actually uses.
+		want := `cp -r /bootstrap-searxng/. /etc/searxng/ && chown -R 977:977 /etc/searxng /var/cache/searxng`
+		if !strings.Contains(ic.Args[0], want) {
+			t.Errorf("init-searxng-config script =\n%s\nwant to contain:\n%s", ic.Args[0], want)
+		}
+	})
+
+	t.Run("chown step runs as root", func(t *testing.T) {
+		sc := ic.SecurityContext
+		if sc == nil {
+			t.Fatal("expected a security context on init-searxng-config")
+		}
+		if sc.RunAsUser == nil || *sc.RunAsUser != 0 {
+			t.Error("chown step must run as root (uid 0)")
+		}
+		if sc.RunAsGroup == nil || *sc.RunAsGroup != 0 {
+			t.Error("chown step must run as group 0")
+		}
+		if sc.RunAsNonRoot != nil && *sc.RunAsNonRoot {
+			t.Error("chown step must not set runAsNonRoot")
+		}
+		if sc.AllowPrivilegeEscalation == nil || *sc.AllowPrivilegeEscalation {
+			t.Error("chown step must not allow privilege escalation")
+		}
+		if sc.Capabilities == nil || !slices.Contains(sc.Capabilities.Drop, "ALL") {
+			t.Error("chown step must drop all capabilities except CHOWN")
+		}
+		if len(sc.Capabilities.Add) != 1 || sc.Capabilities.Add[0] != "CHOWN" {
+			t.Errorf("chown step capabilities.Add = %v, want [CHOWN]", sc.Capabilities.Add)
+		}
+	})
+
+	t.Run("searxng runtime still runs as uid/gid 977 non-root", func(t *testing.T) {
+		c := findContainer(buildStatefulSet(ha, statefulSetInputs{configHash: testConfigHash}), "searxng")
+		if c == nil {
+			t.Fatal("expected searxng container")
+		}
+		sc := c.SecurityContext
+		if sc == nil || sc.RunAsUser == nil || *sc.RunAsUser != 977 {
+			t.Error("searxng container must keep running as uid 977")
+		}
+		if sc == nil || sc.RunAsNonRoot == nil || !*sc.RunAsNonRoot {
+			t.Error("searxng container must keep runAsNonRoot")
+		}
+	})
+
+	t.Run("no chown step when searxng is disabled", func(t *testing.T) {
+		ha := minimalHA()
+		if ic := findInitContainer(buildStatefulSet(ha, statefulSetInputs{configHash: testConfigHash}), "init-searxng-config"); ic != nil {
+			t.Error("expected no init-searxng-config init container when searxng is disabled")
+		}
+	})
+}
+
 func TestOperatorDotEnvSidecars(t *testing.T) {
 	t.Run("searxng: SEARXNG_URL in ConfigMap and init-hermes", func(t *testing.T) {
 		ha := minimalHA()
 		ha.Spec.SearXNG = &agentsv1alpha1.SearXNG{Enabled: true}
 
-		cm, err := buildHermesConfigMap(ha)
+		data, err := buildHermesConfigMapData(ha, resolvedConfigDocuments{})
 		if err != nil {
 			t.Fatal(err)
 		}
-		if cm.Data["SEARXNG_URL"] != "http://localhost:8080" {
-			t.Errorf("expected SEARXNG_URL in ConfigMap, got %q", cm.Data["SEARXNG_URL"])
+		if data["SEARXNG_URL"] != "http://localhost:8080" {
+			t.Errorf("expected SEARXNG_URL in ConfigMap, got %q", data["SEARXNG_URL"])
 		}
 
-		sts := buildStatefulSet(ha)
+		sts := buildStatefulSet(ha, statefulSetInputs{configHash: testConfigHash})
 		ic := findInitContainer(sts, consolidatedInitContainerName)
 		if ic == nil {
 			t.Fatal("expected init-hermes init container")
@@ -872,15 +1517,15 @@ func TestOperatorDotEnvSidecars(t *testing.T) {
 		ha := minimalHA()
 		ha.Spec.Camofox = &agentsv1alpha1.Camofox{Enabled: true}
 
-		cm, err := buildHermesConfigMap(ha)
+		data, err := buildHermesConfigMapData(ha, resolvedConfigDocuments{})
 		if err != nil {
 			t.Fatal(err)
 		}
-		if cm.Data["CAMOFOX_URL"] != "http://localhost:9377" {
-			t.Errorf("expected CAMOFOX_URL in ConfigMap, got %q", cm.Data["CAMOFOX_URL"])
+		if data["CAMOFOX_URL"] != "http://localhost:9377" {
+			t.Errorf("expected CAMOFOX_URL in ConfigMap, got %q", data["CAMOFOX_URL"])
 		}
 
-		sts := buildStatefulSet(ha)
+		sts := buildStatefulSet(ha, statefulSetInputs{configHash: testConfigHash})
 		ic := findInitContainer(sts, consolidatedInitContainerName)
 		if ic == nil {
 			t.Fatal("expected init-hermes init container")
@@ -914,7 +1559,7 @@ func TestOperatorDotEnvMultiplex(t *testing.T) {
 		ha.Spec.SearXNG = &agentsv1alpha1.SearXNG{Enabled: true}
 		ha.Spec.Camofox = &agentsv1alpha1.Camofox{Enabled: true}
 
-		sts := buildStatefulSet(ha)
+		sts := buildStatefulSet(ha, statefulSetInputs{configHash: testConfigHash})
 
 		// Default profile: operator ConfigMap + Secret mounted.
 		defIC := findInitContainer(sts, consolidatedInitContainerName)
@@ -975,7 +1620,7 @@ func TestOperatorDotEnvCollision(t *testing.T) {
 			},
 		},
 	}
-	sts := buildStatefulSet(ha)
+	sts := buildStatefulSet(ha, statefulSetInputs{configHash: testConfigHash})
 	ic := findInitContainer(sts, consolidatedInitContainerName)
 	if ic == nil {
 		t.Fatal("expected init-hermes")
@@ -1000,7 +1645,7 @@ func TestOperatorDotEnvOrdering(t *testing.T) {
 			APIServer: &agentsv1alpha1.HermesAPIServer{Enabled: true},
 		},
 	}
-	sts := buildStatefulSet(ha)
+	sts := buildStatefulSet(ha, statefulSetInputs{configHash: testConfigHash})
 	ic := findInitContainer(sts, consolidatedInitContainerName)
 	if ic == nil {
 		t.Fatal("expected init-hermes")
@@ -1030,10 +1675,81 @@ func TestOperatorDotEnvUserDotEnvAlone(t *testing.T) {
 			},
 		},
 	}
-	sts := buildStatefulSet(ha)
+	sts := buildStatefulSet(ha, statefulSetInputs{configHash: testConfigHash})
 	if findInitContainer(sts, consolidatedInitContainerName) == nil {
 		t.Error("expected dotenv section in init-hermes when user dotEnv is set")
 	}
+}
+
+func TestDotEnvEgress(t *testing.T) {
+	// With egress on, every profile's .env carries the proxy env vars and the
+	// proxy tokens, and never a real key that has a token: hermes-agent
+	// resolves a profile's credentials from its .env and lets .env override
+	// the process env.
+	withProfile := func(ha *agentsv1alpha1.HermesAgent, dotEnv *agentsv1alpha1.HermesDotEnv) *agentsv1alpha1.HermesAgent {
+		ws := &agentsv1alpha1.HermesWorkspace{DotEnv: dotEnv}
+		ha.Spec.Hermes = &agentsv1alpha1.Hermes{
+			Workspace: ws,
+			Profiles:  map[string]agentsv1alpha1.HermesProfile{"work": {Workspace: ws}},
+		}
+		return ha
+	}
+	userDotEnv := &agentsv1alpha1.HermesDotEnv{SecretRef: &corev1.LocalObjectReference{Name: "my-env"}}
+	const tokensLoop = `for f in "/hermes-egress-tokens"/*`
+	initContainers := []struct{ name, proxyEnvVolume string }{
+		{consolidatedInitContainerName, "hermes-operator-dotenv-configmap"},
+		{"init-profile-work", "hermes-operator-dotenv-profile-work"},
+	}
+
+	for _, tt := range []struct {
+		name   string
+		dotEnv *agentsv1alpha1.HermesDotEnv
+	}{
+		{name: "with a user dotenv", dotEnv: userDotEnv},
+		{name: "without a user dotenv"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			sts := buildStatefulSet(withProfile(egressHA(nil), tt.dotEnv), statefulSetInputs{configHash: testConfigHash})
+			for _, want := range initContainers {
+				ic := findInitContainer(sts, want.name)
+				if ic == nil {
+					t.Fatalf("expected %s", want.name)
+				}
+				if !strings.Contains(ic.Args[0], tokensLoop) || !hasVolumeMount(ic.VolumeMounts, "hermes-egress-tokens") {
+					t.Errorf("%s: expected the proxy tokens written to the .env:\n%s", want.name, ic.Args[0])
+				}
+				if tt.dotEnv != nil && !strings.Contains(ic.Args[0], `if [ -f "/hermes-egress-tokens/$key" ]; then continue; fi`) {
+					t.Errorf("%s: expected real keys that have a token skipped:\n%s", want.name, ic.Args[0])
+				}
+				if !volumeHasItem(sts, want.proxyEnvVolume, "HTTPS_PROXY") || !volumeHasItem(sts, want.proxyEnvVolume, "NO_PROXY") {
+					t.Errorf("%s: expected the proxy env vars in volume %s", want.name, want.proxyEnvVolume)
+				}
+			}
+		})
+	}
+
+	t.Run("disabled", func(t *testing.T) {
+		sts := buildStatefulSet(withProfile(minimalHA(), userDotEnv), statefulSetInputs{configHash: testConfigHash})
+		ic := findInitContainer(sts, consolidatedInitContainerName)
+		if strings.Contains(ic.Args[0], "hermes-egress-tokens") || hasVolumeMount(ic.VolumeMounts, "hermes-egress-tokens") {
+			t.Error("expected no egress tokens without egress")
+		}
+	})
+}
+
+// volumeHasItem reports whether the named pod volume projects the given key.
+func volumeHasItem(sts *appsv1.StatefulSet, volume, key string) bool {
+	for _, v := range sts.Spec.Template.Spec.Volumes {
+		if v.Name != volume || v.ConfigMap == nil {
+			continue
+		}
+		for _, item := range v.ConfigMap.Items {
+			if item.Key == key {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func TestDotEnvPluralConfigMapRefs(t *testing.T) {
@@ -1049,7 +1765,7 @@ func TestDotEnvPluralConfigMapRefs(t *testing.T) {
 			},
 		},
 	}
-	sts := buildStatefulSet(ha)
+	sts := buildStatefulSet(ha, statefulSetInputs{configHash: testConfigHash})
 	ic := findInitContainer(sts, consolidatedInitContainerName)
 	if ic == nil {
 		t.Fatal("expected init-hermes")
@@ -1089,7 +1805,7 @@ func TestDotEnvPluralSecretRefs(t *testing.T) {
 			},
 		},
 	}
-	sts := buildStatefulSet(ha)
+	sts := buildStatefulSet(ha, statefulSetInputs{configHash: testConfigHash})
 	ic := findInitContainer(sts, consolidatedInitContainerName)
 	if ic == nil {
 		t.Fatal("expected init-hermes")
@@ -1127,7 +1843,7 @@ func TestDotEnvMixedSingularAndPluralOrder(t *testing.T) {
 			},
 		},
 	}
-	sts := buildStatefulSet(ha)
+	sts := buildStatefulSet(ha, statefulSetInputs{configHash: testConfigHash})
 	ic := findInitContainer(sts, consolidatedInitContainerName)
 	if ic == nil {
 		t.Fatal("expected init-hermes")
@@ -1174,7 +1890,7 @@ func TestDotEnvPluralRefsPerProfile(t *testing.T) {
 			},
 		},
 	}
-	sts := buildStatefulSet(ha)
+	sts := buildStatefulSet(ha, statefulSetInputs{configHash: testConfigHash})
 	ic := findInitContainer(sts, "init-profile-writer")
 	if ic == nil {
 		t.Fatal("expected init-profile-writer")
@@ -1222,7 +1938,7 @@ func TestConsolidatedInitContainers(t *testing.T) {
 		},
 	}
 
-	sts := buildStatefulSet(ha)
+	sts := buildStatefulSet(ha, statefulSetInputs{configHash: testConfigHash})
 
 	// Exactly one consolidated default-profile init container.
 	var initHermes []*corev1.Container
@@ -1322,7 +2038,7 @@ func TestConsolidatedInitContainers(t *testing.T) {
 
 	// User initScripts run after all operator-managed init containers.
 	ha.Spec.Hermes.InitScripts = []agentsv1alpha1.HermesInitScript{{Name: "extra", Script: "echo hi"}}
-	sts2 := buildStatefulSet(ha)
+	sts2 := buildStatefulSet(ha, statefulSetInputs{configHash: testConfigHash})
 	extraIdx, lastManaged := -1, -1
 	for i, c := range sts2.Spec.Template.Spec.InitContainers {
 		if c.Name == "extra" {
@@ -1340,7 +2056,7 @@ func TestConsolidatedInitContainers(t *testing.T) {
 func TestConsolidatedInitContainersMinimal(t *testing.T) {
 	// No profiles: only init-hermes, no per-profile containers; no dotenv section.
 	ha := minimalHA()
-	sts := buildStatefulSet(ha)
+	sts := buildStatefulSet(ha, statefulSetInputs{configHash: testConfigHash})
 	if findInitContainer(sts, consolidatedInitContainerName) == nil {
 		t.Fatal("expected init-hermes")
 	}
@@ -1368,6 +2084,12 @@ func TestBuildProfilesCleanupScript(t *testing.T) {
 	if strings.Contains(got, "profile create") {
 		t.Errorf("cleanup script must not create profiles, got:\n%s", got)
 	}
+	// The operator's manifests are outside the profile directory, so deleting
+	// the profile must remove them too.  Otherwise a re-added profile key finds
+	// a `distribution` manifest with no profile.
+	if !strings.Contains(got, `rm -rf "$HERMES_HOME/.hermes-agent-operator/profiles/$pname"`) {
+		t.Errorf("expected the profile's manifests removed with it, got:\n%s", got)
+	}
 	if !strings.Contains(got, "a\nb") {
 		t.Errorf("expected manifest with sorted names a\\nb, got:\n%s", got)
 	}
@@ -1378,12 +2100,372 @@ func TestBuildProfileCreationScript(t *testing.T) {
 	if !strings.Contains(got, `hermes profile create "coder" --no-alias --clone || true`) {
 		t.Errorf("expected create with clone, got:\n%s", got)
 	}
+	// Dropping `distribution` from a profile drops the operator's state for it,
+	// so adding the same distribution back installs it again.
+	if !strings.Contains(got, `rm -rf "$HERMES_HOME/.hermes-agent-operator/profiles/coder/distribution" "$HERMES_HOME/.hermes-agent-operator/profiles/coder/src"`) {
+		t.Errorf("expected the distribution manifest and checkout removed, got:\n%s", got)
+	}
 	got2 := buildProfileCreationScript("writer", false)
 	if !strings.Contains(got2, `hermes profile create "writer" --no-alias || true`) {
 		t.Errorf("expected create without clone, got:\n%s", got2)
 	}
 	if strings.Contains(got2, "--clone") {
 		t.Errorf("unexpected --clone flag, got:\n%s", got2)
+	}
+}
+
+func TestCronJobsPath(t *testing.T) {
+	if got := cronJobsPath(hermesDefaultProfile); got != "/cron/jobs.json" {
+		t.Errorf("default profile store = %q", got)
+	}
+	if got := cronJobsPath("coder"); got != "/profiles/coder/cron/jobs.json" {
+		t.Errorf("named profile store = %q", got)
+	}
+}
+
+func TestBuildGetJobIDFunction(t *testing.T) {
+	got := buildGetJobIDFunction("coder")
+	if !strings.Contains(got, "get_job_id() {") {
+		t.Errorf("expected a shell function, got:\n%s", got)
+	}
+	if !strings.Contains(got, "/profiles/coder/cron/jobs.json") {
+		t.Errorf("expected the profile's job store, got:\n%s", got)
+	}
+}
+
+func TestBuildStatefulSetInitContainerTerminationMessagePolicy(t *testing.T) {
+	ha := minimalHA()
+	ha.Spec.Hermes = &agentsv1alpha1.Hermes{
+		InitChownData: true,
+		InitScripts:   []agentsv1alpha1.HermesInitScript{{Name: "init-extra", Script: "true"}},
+		Profiles:      map[string]agentsv1alpha1.HermesProfile{"coder": {}},
+	}
+	ha.Spec.SearXNG = &agentsv1alpha1.SearXNG{Enabled: true}
+	// A user-supplied init container is passed through untouched.
+	ha.Spec.InitContainers = []corev1.Container{{Name: "init-user", Image: "busybox"}}
+
+	sts := buildStatefulSet(ha, statefulSetInputs{configHash: testConfigHash})
+	var managed int
+	for _, c := range sts.Spec.Template.Spec.InitContainers {
+		if c.Name == "init-user" {
+			if c.TerminationMessagePolicy != "" {
+				t.Errorf("user init container must be passed through untouched, got policy %q", c.TerminationMessagePolicy)
+			}
+			continue
+		}
+		managed++
+		if c.TerminationMessagePolicy != corev1.TerminationMessageFallbackToLogsOnError {
+			t.Errorf("init container %s: policy = %q, want FallbackToLogsOnError", c.Name, c.TerminationMessagePolicy)
+		}
+	}
+	// init-chown-data, init-hermes, init-profile-coder, init-extra and
+	// init-searxng-config.
+	if managed < 5 {
+		t.Errorf("expected at least 5 managed init containers, got %d", managed)
+	}
+}
+
+func TestBuildProfileDistributionScript(t *testing.T) {
+	const source = "github.com/you/research-bot"
+
+	t.Run("unpinned installs from the URL and re-pulls on start", func(t *testing.T) {
+		got := buildProfileDistributionScript("coder", &agentsv1alpha1.HermesProfileDistribution{Source: source}, "")
+		if !strings.Contains(got, `SOURCE="github.com/you/research-bot"`) {
+			t.Errorf("expected the source, got:\n%s", got)
+		}
+		if !strings.Contains(got, `hermes profile install "$SOURCE" --name "coder" --force --yes`) {
+			t.Errorf("expected an install from the URL, got:\n%s", got)
+		}
+		if !strings.Contains(got, `hermes profile update "coder" --yes`) {
+			t.Errorf("expected an update on start, got:\n%s", got)
+		}
+		// The profile comes from the `distribution`, never from profile create.
+		if strings.Contains(got, "hermes profile create") {
+			t.Errorf("a distribution profile must not be created separately, got:\n%s", got)
+		}
+		// The operator installs an unpinned `distribution` from its URL.  Thus
+		// the profile records the URL, and a manual update can pull it again.
+		if strings.Contains(got, "git clone") {
+			t.Errorf("an unpinned distribution must not be cloned by the operator, got:\n%s", got)
+		}
+		// A failed update keeps the installed revision rather than stopping
+		// an agent that already works.
+		if !strings.Contains(got, `|| echo "Profile coder: hermes profile update failed, so the profile stays at its installed revision.`) {
+			t.Errorf("expected a failed update to be reported and skipped, got:\n%s", got)
+		}
+		// A checkout from an earlier pin is no longer used.
+		if !strings.Contains(got, "  rm -rf \"$STAGED\"\n  printf '%s' \"$DESIRED\"") {
+			t.Errorf("expected the staged checkout removed after an unpinned install, got:\n%s", got)
+		}
+	})
+
+	t.Run("the installed profile must still exist to skip the install", func(t *testing.T) {
+		got := buildProfileDistributionScript("coder", &agentsv1alpha1.HermesProfileDistribution{Source: source}, "")
+		if !strings.Contains(got, `PROFILE_DIR="$HERMES_HOME/profiles/coder"`) {
+			t.Errorf("expected the profile directory, got:\n%s", got)
+		}
+		if !strings.Contains(got, `[ "$(cat "$MANIFEST")" = "$DESIRED" ] && [ -f "$PROFILE_DIR/distribution.yaml" ]`) {
+			t.Errorf("expected the manifest match to check the profile, got:\n%s", got)
+		}
+	})
+
+	t.Run("updateOnStart false leaves the installed revision alone", func(t *testing.T) {
+		no := false
+		got := buildProfileDistributionScript("coder", &agentsv1alpha1.HermesProfileDistribution{
+			Source: source, UpdateOnStart: &no,
+		}, "")
+		if strings.Contains(got, "hermes profile update") {
+			t.Errorf("expected no update, got:\n%s", got)
+		}
+		if !strings.Contains(got, "left at its installed revision") {
+			t.Errorf("expected the no-op branch to say so, got:\n%s", got)
+		}
+	})
+
+	t.Run("forceConfig reaches the update", func(t *testing.T) {
+		got := buildProfileDistributionScript("coder", &agentsv1alpha1.HermesProfileDistribution{
+			Source: source, ForceConfig: true,
+		}, "")
+		if !strings.Contains(got, `hermes profile update "coder" --force-config --yes`) {
+			t.Errorf("expected --force-config, got:\n%s", got)
+		}
+	})
+
+	t.Run("pinned clones at the ref and installs from the checkout", func(t *testing.T) {
+		got := buildProfileDistributionScript("coder", &agentsv1alpha1.HermesProfileDistribution{
+			Source: source, Ref: "v1.2.0",
+		}, "")
+		if !strings.Contains(got, `REF="v1.2.0"`) {
+			t.Errorf("expected the ref, got:\n%s", got)
+		}
+		if !strings.Contains(got, `git clone --depth 1 --branch "$REF" "$CLONE_URL" "$STAGED"`) {
+			t.Errorf("expected a clone at the ref, got:\n%s", got)
+		}
+		// git would read the shorthand the CLI accepts as a local path.
+		if !strings.Contains(got, `CLONE_URL="https://github.com/you/research-bot"`) {
+			t.Errorf("expected the shorthand expanded for the clone, got:\n%s", got)
+		}
+		// The manifest still records what the custom resource declared.
+		if !strings.Contains(got, `SOURCE="github.com/you/research-bot"`) {
+			t.Errorf("expected the declared source recorded, got:\n%s", got)
+		}
+		// A commit SHA is not a valid --branch argument.
+		if !strings.Contains(got, `git -C "$STAGED" fetch -q --depth 1 origin "$REF"`) {
+			t.Errorf("expected the explicit fetch fallback, got:\n%s", got)
+		}
+		// The checkout is not a git repository once installed, matching what
+		// the Hermes CLI does with its own clones.
+		if !strings.Contains(got, `rm -rf "$STAGED/.git"`) {
+			t.Errorf("expected .git to be removed, got:\n%s", got)
+		}
+		// A branch resolves once, so the log keeps the commit it resolved to.
+		revParse := strings.Index(got, `git -C "$STAGED" rev-parse HEAD`)
+		if revParse < 0 || revParse > strings.Index(got, `rm -rf "$STAGED/.git"`) {
+			t.Errorf("expected the resolved commit logged before .git is removed, got:\n%s", got)
+		}
+		// git must fail on a missing credential instead of asking for one.
+		if !strings.Contains(got, "export GIT_TERMINAL_PROMPT=0") {
+			t.Errorf("expected git prompts disabled, got:\n%s", got)
+		}
+		if !strings.Contains(got, `hermes profile install "$STAGED" --name "coder" --force --yes`) {
+			t.Errorf("expected an install from the checkout, got:\n%s", got)
+		}
+		// The pin is the version: a restart must not pull a newer revision.
+		if strings.Contains(got, "hermes profile update") {
+			t.Errorf("a pinned distribution must not update on start, got:\n%s", got)
+		}
+	})
+
+	t.Run("the manifest records the source and the ref", func(t *testing.T) {
+		got := buildProfileDistributionScript("coder", &agentsv1alpha1.HermesProfileDistribution{
+			Source: source, Ref: "v1.2.0",
+		}, "")
+		if !strings.Contains(got, "DESIRED=\"$SOURCE\t$REF\"") {
+			t.Errorf("expected source and ref in the manifest value, got:\n%s", got)
+		}
+		if !strings.Contains(got, `printf '%s' "$DESIRED" > "$MANIFEST"`) {
+			t.Errorf("expected the manifest to be written after installing, got:\n%s", got)
+		}
+		if !strings.Contains(got, "profiles/coder/distribution") {
+			t.Errorf("expected a per-profile manifest path, got:\n%s", got)
+		}
+	})
+
+	t.Run("a failure is reported as a termination message", func(t *testing.T) {
+		got := buildProfileDistributionScript("coder", &agentsv1alpha1.HermesProfileDistribution{Source: source}, "")
+		if !strings.Contains(got, "> /dev/termination-log") {
+			t.Errorf("expected a curated termination message, got:\n%s", got)
+		}
+		if !strings.Contains(got, "exit 1") {
+			t.Errorf("expected a failure to abort the init container, got:\n%s", got)
+		}
+	})
+}
+
+func TestGitCloneURL(t *testing.T) {
+	tests := []struct {
+		source string
+		want   string
+	}{
+		// The one shorthand the Hermes CLI accepts, which git would otherwise
+		// read as a local path.
+		{"github.com/you/research-bot", "https://github.com/you/research-bot"},
+		{"github.com/you/research-bot/", "https://github.com/you/research-bot"},
+		// Other sources do not change, including a source without a scheme on
+		// another host.  The CLI reads that as a local directory.  If the
+		// operator expanded it, a pinned profile could install from a location
+		// that an unpinned profile cannot.
+		{"gitlab.com/team/research-bot", "gitlab.com/team/research-bot"},
+		{"https://github.com/you/research-bot", "https://github.com/you/research-bot"},
+		{"https://git.example.com/team/bot.git", "https://git.example.com/team/bot.git"},
+		{"git@github.com:you/research-bot.git", "git@github.com:you/research-bot.git"},
+		{"/srv/profiles/research-bot", "/srv/profiles/research-bot"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.source, func(t *testing.T) {
+			if got := gitCloneURL(tt.source); got != tt.want {
+				t.Errorf("gitCloneURL(%q) = %q, want %q", tt.source, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestBuildProfileDistributionScriptGitCredentials(t *testing.T) {
+	dist := &agentsv1alpha1.HermesProfileDistribution{Source: "https://git.example.com/team/bot.git"}
+
+	t.Run("no credentials leaves git configuration alone", func(t *testing.T) {
+		got := buildProfileDistributionScript("coder", dist, "")
+		if strings.Contains(got, "GIT_CONFIG") {
+			t.Errorf("expected no git configuration without credentials, got:\n%s", got)
+		}
+	})
+
+	t.Run("credentials are configured through the environment", func(t *testing.T) {
+		got := buildProfileDistributionScript("coder", dist, "/hermes-git-credentials-coder/.git-credentials")
+		if !strings.Contains(got, `CREDENTIALS="/hermes-git-credentials-coder/.git-credentials"`) {
+			t.Errorf("expected the mounted credential store, got:\n%s", got)
+		}
+		if !strings.Contains(got, "export GIT_CONFIG_KEY_0=credential.helper") ||
+			!strings.Contains(got, `export GIT_CONFIG_VALUE_0="store --file=$CREDENTIALS"`) {
+			t.Errorf("expected the credential helper in the environment, got:\n%s", got)
+		}
+		// A missing key is named, rather than surfacing as an auth failure.
+		if !strings.Contains(got, `has no key .git-credentials`) {
+			t.Errorf("expected a pre-flight check naming the key, got:\n%s", got)
+		}
+		// The token must not reach a config file on a writable volume.
+		if strings.Contains(got, "git config") || strings.Contains(got, ".gitconfig") {
+			t.Errorf("expected no git config file to be written, got:\n%s", got)
+		}
+	})
+}
+
+func TestBuildStatefulSetProfileDistributionGitCredentials(t *testing.T) {
+	ha := minimalHA()
+	ha.Spec.Hermes = &agentsv1alpha1.Hermes{
+		Profiles: map[string]agentsv1alpha1.HermesProfile{
+			"researcher": {Distribution: &agentsv1alpha1.HermesProfileDistribution{
+				Source: "https://git.example.com/team/bot.git",
+				GitCredentials: &agentsv1alpha1.HermesGitCredentials{
+					SecretRef: corev1.LocalObjectReference{Name: "bot-git-credentials"},
+				},
+			}},
+		},
+	}
+
+	sts := buildStatefulSet(ha, statefulSetInputs{configHash: testConfigHash})
+	const volumeName = "hermes-git-credentials-researcher"
+
+	var volume *corev1.Volume
+	for i, v := range sts.Spec.Template.Spec.Volumes {
+		if v.Name == volumeName {
+			volume = &sts.Spec.Template.Spec.Volumes[i]
+		}
+	}
+	if volume == nil {
+		t.Fatalf("expected a %s volume", volumeName)
+	}
+	if volume.Secret == nil || volume.Secret.SecretName != "bot-git-credentials" {
+		t.Errorf("expected the credentials Secret as the volume source, got %+v", volume.VolumeSource)
+	}
+
+	// Mounted read-only into that profile's init container...
+	init := findInitContainer(sts, "init-profile-researcher")
+	var mounted bool
+	for _, m := range init.VolumeMounts {
+		if m.Name == volumeName {
+			mounted = true
+			if !m.ReadOnly {
+				t.Error("expected the credentials mount to be read-only")
+			}
+			if !strings.Contains(init.Args[0], m.MountPath+"/.git-credentials") {
+				t.Errorf("expected the script to use %s, got:\n%s", m.MountPath, init.Args[0])
+			}
+		}
+	}
+	if !mounted {
+		t.Error("expected the credentials mounted into init-profile-researcher")
+	}
+
+	// ...and nowhere else, so the running agent cannot read the token.
+	for _, c := range sts.Spec.Template.Spec.Containers {
+		for _, m := range c.VolumeMounts {
+			if m.Name == volumeName {
+				t.Errorf("credentials must not be mounted into container %s", c.Name)
+			}
+		}
+	}
+	for _, c := range sts.Spec.Template.Spec.InitContainers {
+		if c.Name == "init-profile-researcher" {
+			continue
+		}
+		for _, m := range c.VolumeMounts {
+			if m.Name == volumeName {
+				t.Errorf("credentials must not be mounted into init container %s", c.Name)
+			}
+		}
+	}
+}
+
+func TestBuildStatefulSetProfileDistribution(t *testing.T) {
+	ha := minimalHA()
+	ha.Spec.Hermes = &agentsv1alpha1.Hermes{
+		Profiles: map[string]agentsv1alpha1.HermesProfile{
+			"researcher": {
+				Distribution: &agentsv1alpha1.HermesProfileDistribution{
+					Source: "github.com/you/research-bot",
+					Ref:    "v1.2.0",
+				},
+				Config: &agentsv1alpha1.HermesProfileConfig{Raw: imageJSON(`{"model":"opus"}`)},
+				Skills: []agentsv1alpha1.HermesSkill{{Identifier: "owner/skills/review", Name: "review"}},
+			},
+			"plain": {},
+		},
+	}
+
+	sts := buildStatefulSet(ha, statefulSetInputs{configHash: testConfigHash})
+
+	script := findInitContainer(sts, "init-profile-researcher").Args[0]
+	if !strings.Contains(script, `hermes profile install "$STAGED" --name "researcher"`) {
+		t.Errorf("expected the distribution install, got:\n%s", script)
+	}
+	if strings.Contains(script, "hermes profile create") {
+		t.Errorf("expected no profile creation for a distribution, got:\n%s", script)
+	}
+	// The operator's own declarations are layered on top of the `distribution`,
+	// so they run after the install.
+	installIdx := strings.Index(script, "hermes profile install")
+	configIdx := strings.Index(script, "/bootstrap/profile.researcher.config.yaml")
+	skillsIdx := strings.Index(script, "hermes skills install")
+	if configIdx < installIdx || skillsIdx < installIdx {
+		t.Errorf("expected config (%d) and skills (%d) after the install (%d):\n%s",
+			configIdx, skillsIdx, installIdx, script)
+	}
+
+	// A profile without a `distribution` is created as before.
+	plain := findInitContainer(sts, "init-profile-plain").Args[0]
+	if !strings.Contains(plain, `hermes profile create "plain" --no-alias`) {
+		t.Errorf("expected plain profile creation, got:\n%s", plain)
 	}
 }
 

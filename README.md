@@ -82,6 +82,7 @@ Then run the `/hermes-agent-operator` skill to create a custom resource.
 - [`hermes.bundles`](#hermesbundles)
 - [`hermes.env` / `hermes.envFrom`](#hermesenv--hermesenvfrom)
 - [`hermes.resources`](#hermesresources)
+- [`hermes.image`](#hermesimage)
 - [`hermes.initChownData`](#hermesinit​chowndata)
 - [`hermes.initScripts`](#hermesinitscripts)
 - [`hermes.profiles`](#hermesprofiles)
@@ -92,11 +93,15 @@ Then run the `/hermes-agent-operator` skill to create a custom resource.
 - [`networking.service`](#networkingservice)
 - [`networking.ingress`](#networkingingress)
 - [`suspend`](#suspend)
+- [`hostUsers`](#hostusers)
 - [`podAnnotations`](#podannotations)
+- [`podLabels`](#podlabels)
+- [`priorityClassName`](#priorityclassname)
+- [`runtimeClassName`](#runtimeclassname)
 
 ### `hermes.config`
 
-Configure the Hermes agent runtime. `raw`, `apiServer`, and `webhook` can be used independently or together.
+Configure the Hermes agent runtime. `raw`, `configMapRef`, `apiServer`, and `webhook` can be used independently or together, except that `raw` and `configMapRef` are mutually exclusive.
 
 #### `raw`
 
@@ -110,6 +115,28 @@ hermes:
         provider: anthropic
         default: claude-sonnet-4-6
 ```
+
+#### `configMapRef`
+
+Read the same `config.yml` from a `ConfigMap` in the agent's namespace instead of holding it inline. Use this to keep a long config out of the `HermesAgent`, to generate it with a `kustomize` `configMapGenerator`, or to let a different pipeline own the config's lifecycle.
+
+```yaml
+hermes:
+  config:
+    configMapRef:
+      name: my-agent-config        # required; `ConfigMap` in the agent's namespace
+      key: config.yaml             # optional; defaults to "config.yaml"
+```
+
+```sh
+kubectl create configmap my-agent-config --from-file=config.yaml=./config.yaml
+```
+
+The referenced document is treated exactly as `raw` is: the operator applies the same defaults to it (`web.search_backend` for SearXNG, `gateway.multiplex_profiles` for profiles) and copies the result into its own bootstrap `ConfigMap`. A change to the referenced `ConfigMap` reconciles the agent and restarts the `Pod`, because the init containers read the config only at start.
+
+> **Note:** Reconciliation fails, with the reason on the `Ready` condition, while the `ConfigMap` or the key is missing, or when `raw` is set as well. `raw` is free-form, so the API server cannot reject that pair at admission time.
+
+The same field is available per profile. See [`hermes.profiles`](#hermesprofiles).
 
 #### `apiServer`
 
@@ -237,19 +264,30 @@ hermes:
 
 #### `dotEnv`
 
-Generate a `$HERMES_HOME/.env` file from a Kubernetes ConfigMap and/or Secret. Each key in the referenced object(s) becomes a `KEY=VALUE` line in the file. Useful for tools that read `.env` files at startup.
+Generate a `$HERMES_HOME/.env` file from Kubernetes ConfigMaps and/or Secrets. Each key in the referenced object(s) becomes a `KEY=VALUE` line in the file. Useful for tools that read `.env` files at startup.
 
-At least one of `configMapRef`/`secretRef` must be set; both may be set at once. If a key exists in both, the Secret's value wins.
+At least one of `configMapRefs`/`secretRefs` must be set; both may be set at once, and each list may contain multiple entries (up to 64 per list).
 
 ```yaml
 hermes:
   workspace:
     dotEnv:                        # optional; omit if no .env file is needed
-      configMapRef:
-        name: my-env-configmap     # non-secret values
-      secretRef:
-        name: my-env-secret        # secret values; overrides configMap on key collision
+      configMapRefs:               # non-secret values
+        - name: my-env-configmap
+        - name: my-other-configmap
+      secretRefs:                  # secret values
+        - name: my-env-secret
+        - name: my-api-keys
 ```
+
+**Precedence on key collision** (last-wins):
+
+1. `configMapRefs` entries, in list order
+2. `secretRefs` entries, in list order
+
+Secrets override ConfigMaps, and later entries override earlier ones.
+
+> **Note:** The singular `configMapRef`/`secretRef` forms are still accepted for compatibility but are deprecated; they will be removed in the v1 type. They take the lowest precedence: ConfigMap first, then Secret, then the plural lists above.
 
 ### `hermes.packages`
 
@@ -331,6 +369,7 @@ hermes:
   plugins:                         # optional; omit if no plugins are needed
     - identifier: hermes-agent/plugin-stocks  # required; owner/repo or full Git URL
       enable: true                 # optional; defaults to true (auto-enable after install)
+      ref: a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0  # optional; 40-char Git commit SHA to pin an immutable plugin revision
 ```
 
 ### `hermes.skills`
@@ -363,6 +402,12 @@ hermes:
       script: standup.sh           # optional; path under ~/.hermes/scripts/
       noAgent: false               # optional; true to run script and deliver stdout directly, skipping the LLM
       workdir: /home/hermes        # optional; absolute working directory for the job
+      monitorScript: source.sh     # optional; monitor mode: script under ~/.hermes/scripts/ run each tick BEFORE the agent; unchanged output suppresses the agent run (mutually exclusive with monitorURL)
+      monitorURL: https://example.com/status  # optional; monitor mode: http(s) URL fetched each tick instead of a script (mutually exclusive with monitorScript)
+      model: gpt-5                 # optional; pin this job to a specific inference model
+      provider: openrouter         # optional; inference provider paired with model (e.g. 'openrouter', 'nous')
+      reasoningEffort: high        # optional; none, minimal, low, medium, high, xhigh, max, or ultra
+      continuity: false            # optional; true to inject the job's previous output into each run's prompt
       profile: default             # optional; Hermes profile name to run under
 ```
 
@@ -412,6 +457,39 @@ hermes:
       memory: 1Gi
 ```
 
+### `hermes.image`
+
+Override the agent image used for the hermes-agent container and all init containers. Defaults to `nousresearch/hermes-agent:latest`.
+
+The image is a full image reference string, so it accepts a tag:
+
+```yaml
+hermes:
+  image: nousresearch/hermes-agent:v1.2.3    # optional; omit to use the default image
+```
+
+...or a digest, for an immutable reference:
+
+```yaml
+hermes:
+  image: nousresearch/hermes-agent@sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
+```
+
+A reference without a tag or digest (e.g. `nousresearch/hermes-agent`) uses the `latest` tag per Kubernetes image semantics.
+
+> **Backward compatibility:** the deprecated object form is still accepted, but
+> the operator logs a warning on each reconciliation, and the next API version
+> will require `image` to be a plain string:
+>
+> ```yaml
+> hermes:
+>   image:
+>     repository: nousresearch/hermes-agent
+>     tag: latest
+> ```
+>
+> Prefer the string form; it also works with [kustomize image overrides](https://kubectl.docs.kubernetes.io/references/kustomize/kustomization/images/).
+
 ### `hermes.initChownData`
 
 Run an init container that sets `/opt/data` ownership to the hermes user (`10000:10000`). Useful when using an existing PVC whose data was written by a different user.
@@ -457,6 +535,10 @@ hermes:
         raw:                           # optional; raw config.yaml content (JSON-serialized)
           model: claude-sonnet-4-5
           # NOTE: apiServer and webhook are not supported here
+        # or, mutually exclusive with raw, read it from a `ConfigMap`:
+        # configMapRef:
+        #   name: coder-config
+        #   key: config.yaml           # optional; defaults to "config.yaml"
       workspace:
         dotEnv:                        # optional; write .env from a ConfigMap and/or Secret
           secretRef:
@@ -480,6 +562,76 @@ hermes:
 
 > **Tip:** Use `workspace.dotEnv` on each profile to load environment variables from a ConfigMap and/or Secret. This is the recommended way to isolate credentials and configuration (e.g. API keys, tokens) per profile without leaking them across profiles.
 
+#### `distribution`
+
+Install a profile from a [profile distribution](https://hermes-agent.nousresearch.com/docs/user-guide/profile-distributions). A profile distribution is a git repository that holds a complete agent: a `distribution.yaml` manifest, `SOUL.md`, `config.yaml`, `mcp.json`, skills, and cron jobs. Use it to run a specialist agent that someone else maintains. You can also keep your own agent in its own repository, instead of inline in each `HermesAgent`.
+
+```yaml
+hermes:
+  profiles:
+    researcher:
+      distribution:
+        source: https://github.com/you/research-bot   # required; git URL, github.com/owner/repo, or a path in the container
+        # renovate: datasource=github-tags depName=you/research-bot
+        ref: v1.2.0                                   # optional; pin to a tag, branch, or commit SHA
+        updateOnStart: true                           # optional; defaults to true, ignored when ref is set
+        forceConfig: false                            # optional; let an update overwrite config.yaml, ignored when ref is set
+      workspace:
+        dotEnv:                                       # supply the env vars the distribution requires
+          secretRef:
+            name: research-bot-env
+```
+
+Any other profile fields you declare are applied on top of the distribution. A declared `config` or `workspace.files` entry replaces the distribution's copy, and declared `plugins`, `skills`, `bundles`, and `crons` are installed next to the ones it ships. Fields you leave out keep what the distribution ships. Without `config`, for example, the profile runs the distribution's own `config.yaml`. Deleting the profile key deletes the profile, as it does for any named profile.
+
+**Pinning and updates.** With `ref` set, the operator clones that revision and installs it again only when `source` or `ref` changes, so a `Pod` restart never pulls a newer revision. A branch is resolved once, at install, and stays at that commit until you change `ref`; the init container log records the commit. Pin to a tag or a commit SHA so that the custom resource names the exact revision you run. Without `ref`, the profile follows the repository's default branch and is pulled again on every `Pod` start with `hermes profile update`, which keeps your data and, unless `forceConfig` is `true`, your `config.yaml`. If that update fails, for example because the repository is unreachable, the profile stays at its installed revision and the agent still starts.
+
+Pinning to a tag is recommended, because a bot can then propose each version change for review. Renovate has no manager for this field. Use the `# renovate:` comment above together with a custom manager:
+
+```json
+{
+  "customManagers": [
+    {
+      "customType": "regex",
+      "managerFilePatterns": ["/\\.ya?ml$/"],
+      "matchStrings": ["# renovate: datasource=(?<datasource>\\S+) depName=(?<depName>\\S+)\\s+ref:\\s*[\"']?(?<currentValue>[^\"'\\s]+)"],
+      "versioningTemplate": "semver"
+    }
+  ]
+}
+```
+
+**Private repositories.** Use `gitCredentials` for a private repository on any host, pinned or not:
+
+```yaml
+hermes:
+  profiles:
+    researcher:
+      distribution:
+        source: https://git.example.com/team/research-bot.git
+        gitCredentials:
+          secretRef:
+            name: research-bot-git
+          key: .git-credentials      # optional; defaults to ".git-credentials"
+```
+
+The `Secret` key holds a [git credential store](https://git-scm.com/docs/git-credential-store) file, one entry per line:
+
+```sh
+kubectl create secret generic research-bot-git \
+  --from-literal=.git-credentials='https://oauth2:glpat-xxxxxxxx@git.example.com'
+```
+
+Each profile names its own `Secret` and key, so distributions that need different credentials can each have one. Give each profile its own `Secret`, or keep one `Secret` with a key per profile. Within one file, git uses the first entry for a host, so two repositories on the same host that need different tokens need different keys.
+
+The operator mounts the `Secret` only into the init container of that profile, not into the agent container. Thus the running agent cannot read the token. The operator gives the credential to git through the environment and does not write a `.gitconfig`, so the token is not on the data volume. Kubernetes keeps `Secret` volumes in tmpfs, so the token is not written to the disk of the node.
+
+> **Note:** Without `ref`, the Hermes CLI runs the clone. It tries without a credential first and uses the one from `gitCredentials` when the host asks for it, as GitHub, GitLab, Codeberg, and Bitbucket all do for a private repository. That retry arrived in hermes-agent `v2026.9.21`. On an older image, or with a host that answers 404 instead of asking for credentials, set `ref` so that the operator runs the clone with the credential from the start.
+
+> **Note:** Distributions must be reachable over HTTPS (port 443). The [default `NetworkPolicy`](#securitynetworkpolicy) allows this. Git over SSH (port 22) needs an `additionalEgress` rule.
+>
+> Cron jobs from a distribution arrive **paused**, by design. Review them with `hermes -p <profile> cron list` before you resume them. The default profile cannot come from a distribution, because the Hermes CLI does not install one over `~/.hermes`. For the default profile, use [`hermes.config.configMapRef`](#configmapref).
+
 ### `searxng`
 
 Optional sidecar that runs a local [SearXNG](https://github.com/searxng/searxng) instance, enabling the agent's `web_search` tool without an external API key. When enabled, the operator automatically injects `SEARXNG_URL` into the agent container and sets `web.search_backend: "searxng"` in the generated Hermes config (unless already set in `hermes.config.raw`):
@@ -492,9 +644,7 @@ web:
 ```yaml
 searxng:
   enabled: true                    # defaults to false; omit the entire block to disable
-  image:                           # optional; omit to use the default image (searxng/searxng:latest)
-    repository: searxng/searxng
-    tag: latest
+  image: searxng/searxng:latest    # optional; omit to use the default image (searxng/searxng:latest)
   resources:                       # optional; omit to use no resource constraints
     limits:
       cpu: 500m
@@ -526,9 +676,7 @@ Optional sidecar for browser automation via [Camofox](https://github.com/jo-inc/
 ```yaml
 camofox:
   enabled: true                    # defaults to false; omit the entire block to disable
-  image:                           # optional; omit to use the default image (ghcr.io/jo-inc/camofox-browser:latest)
-    repository: ghcr.io/jo-inc/camofox-browser
-    tag: latest
+  image: ghcr.io/jo-inc/camofox-browser:latest    # optional; omit to use the default image
   resources:                       # optional; omit to use no resource constraints
     limits:
       cpu: "1"
@@ -634,6 +782,18 @@ Pause the agent by scaling its StatefulSet to 0 without deleting the resource or
 suspend: true                      # optional; defaults to false
 ```
 
+### `hostUsers`
+
+Run the agent pod in its own [user namespace](https://kubernetes.io/docs/concepts/workloads/pods/user-namespaces/). The agent container runs as root, and a user namespace maps that root to an unprivileged UID on the node, so a container breakout does not land on the node as root.
+
+```yaml
+hostUsers: false                   # optional; omit to share the host user namespace
+```
+
+Omitting the field, or setting it to `true`, leaves the pod in the host user namespace — the Kubernetes default. A change to this value starts a rolling restart of the `StatefulSet`'s pods.
+
+User namespaces are stable as of Kubernetes v1.36, where the `UserNamespacesSupport` feature gate is locked on and ignored; they were on by default for several releases before that. What still gates the feature is the node. The pod must land on a Linux node meeting [the requirements](https://kubernetes.io/docs/concepts/workloads/pods/user-namespaces/#before-you-begin): kernel 6.3 or newer, a CRI runtime that supports user namespaces (containerd 2.0+ or CRI-O 1.25+), and idmap-capable filesystems both for the kubelet directory and for every volume the pod mounts. Where only some nodes in a cluster qualify, schedule the agent onto one that does.
+
 ### `podAnnotations`
 
 Add custom annotations to the agent's pod template. Changing any key/value triggers a rolling restart of the StatefulSet's pods — set a key like `rotatedAt` to an RFC3339 timestamp and update it whenever a restart is needed, equivalent to `kubectl rollout restart statefulset`.
@@ -641,8 +801,39 @@ Add custom annotations to the agent's pod template. Changing any key/value trigg
 ```yaml
 podAnnotations:                      # optional
   rotatedAt: "2026-07-06T12:00:00Z"  # any change here triggers a rolling restart
-  prometheus.io/scrape: "true"       # also usable for ordinary pod annotations
 ```
+
+### `podLabels`
+
+Add labels to the agent's pod template.  An object that selects pods by label, such as a `NetworkPolicy` or a `PodMonitor`, can then select the agent pod.
+
+```yaml
+podLabels:                           # optional
+  example.com/internet-client: "true"
+  example.com/traefik-route: "true"
+```
+
+The operator-managed `app.kubernetes.io/name`, `app.kubernetes.io/instance` and `app.kubernetes.io/managed-by` labels are applied last and always win.  An entry in `podLabels` cannot shadow one of them, and cannot break the `StatefulSet` pod selector.  The labels go on the **pod template only**; the `StatefulSet` labels do not change.  A change to any key starts a rolling restart.
+
+### `priorityClassName`
+
+Assign the agent `Pod` a [`PriorityClass`](https://kubernetes.io/docs/concepts/scheduling-eviction/pod-priority-preemption/).  A `PriorityClass` controls the `Pod`'s scheduling order.  It also controls how early the `Pod` is evicted under node pressure.
+
+```yaml
+priorityClassName: system-cluster-critical  # optional; omit to use the cluster's globalDefault
+```
+
+The `PriorityClass` must already exist in the cluster.  The operator does not create it.  A change to this value starts a rolling restart of the `StatefulSet`'s pods.
+
+### `runtimeClassName`
+
+Run the agent `Pod` under a named [`RuntimeClass`](https://kubernetes.io/docs/concepts/containers/runtime-class/).  This replaces the cluster's default container runtime for this `Pod`.  The agent executes model-authored shell commands, so a sandboxed runtime such as gVisor or Kata Containers is a good fit for it.
+
+```yaml
+runtimeClassName: kata-qemu          # optional; omit to use the cluster default runtime
+```
+
+The `RuntimeClass` must already exist in the cluster.  The operator does not create it.  A change to this value starts a rolling restart of the `StatefulSet`'s pods.
 
 ## Heartbeat
 
@@ -675,9 +866,29 @@ They aren't. The operator only manages what is explicitly declared in the `Herme
 
 Only the `HERMES_HOME` path (`/opt/data`) is persisted across pod restarts. Anything that needs to survive a restart must be placed under `HERMES_HOME`. The operator sets `HOME=/opt/data/home` so tools that respect `$HOME` will write there automatically.
 
+**Q: The agent is stuck in `Init`. How do I find out why?**
+
+Check `status.conditions` first. When an init container fails, the operator sets an `InitFailed` condition naming the container and the detail Kubernetes reported for it, which is the tail of that container's log when the step wrote no message of its own:
+
+```sh
+kubectl get hermesagent my-agent -o jsonpath='{.status.conditions[?(@.type=="InitFailed")]}'
+```
+
+`status.reason` carries the same short code (`Error`, `ImagePullBackOff`, `CrashLoopBackOff`) in preference to the `PodInitializing` a `Pod` reports while its init containers are still being worked through. For the full log of the failing step, use the container name from the condition:
+
+```sh
+kubectl logs my-agent-0 -c init-hermes
+```
+
+The condition clears on its own once no init container reports a failure.
+
 **Q: Why does the Hermes container run as root?**
 
 The official Hermes image uses [s6-overlay](https://github.com/just-containers/s6-overlay), which requires the process to start as root for service supervision setup. Once initialisation is complete, s6-overlay drops privileges and runs the agent as the `hermes` user (`10000:10000`).
+
+## Community
+
+Join our [Discord](https://discord.gg/zZSUqa2egD) to ask questions and share feedback.
 
 ## Contributing
 

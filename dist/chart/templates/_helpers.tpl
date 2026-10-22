@@ -51,13 +51,36 @@ Dynamically calculates safe truncation to ensure total name length <= 63 chars.
 
 {{/*
 ServiceAccount name to use.
-If serviceAccount.enable is false and serviceAccount.name is set, use that name.
+If serviceAccount.enabled is false and serviceAccount.name is set, use that name.
 Otherwise, use the standard resourceName helper with "controller-manager" suffix.
 */}}
 {{- define "hermes-agent-operator.serviceAccountName" -}}
-{{- if and (not (.Values.serviceAccount.enable | default true)) .Values.serviceAccount.name }}
+{{- if and (not (.Values.serviceAccount.enabled | default true)) .Values.serviceAccount.name }}
 {{- .Values.serviceAccount.name }}
 {{- else }}
 {{- include "hermes-agent-operator.resourceName" (dict "suffix" "controller-manager" "context" .) }}
 {{- end }}
+{{- end }}
+
+{{/*
+Whether the metrics endpoint serves a cert-manager-issued certificate.
+Renders "true" or an empty string. The `Certificate`, the manager mount, and the
+`ServiceMonitor` TLS config all key off this, so they never disagree.
+*/}}
+{{- define "hermes-agent-operator.metricsCertEnabled" -}}
+{{- if and .Values.certManager.enabled .Values.metrics.enabled .Values.metrics.secure }}true{{- end }}
+{{- end }}
+
+{{/*
+Name of the `Secret` that holds the metrics certificate.
+*/}}
+{{- define "hermes-agent-operator.metricsCertSecretName" -}}
+metrics-server-cert
+{{- end }}
+
+{{/*
+Directory where the manager mounts the metrics certificate.
+*/}}
+{{- define "hermes-agent-operator.metricsCertDir" -}}
+/tmp/k8s-metrics-server/metrics-certs
 {{- end }}
