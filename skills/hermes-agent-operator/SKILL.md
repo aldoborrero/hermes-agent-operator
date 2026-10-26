@@ -87,7 +87,7 @@ Example manifests are available in the `examples/` directory alongside this skil
 |-------|----------|-------|
 | Agent name (`metadata.name`) | Yes | lowercase DNS label |
 | Namespace | No | default: `default` |
-| Image tag (`spec.hermes.image.tag`) | No | default: `latest` — pin to a specific release in production |
+| Image reference (`spec.hermes.image`) | No | string, default: `nousresearch/hermes-agent:latest`; accepts `:tag` or `@sha256:...` digest pinning |
 | Model provider | Yes | e.g. `anthropic`, `openai`, `ollama-cloud` |
 | Model name | Yes | e.g. `claude-sonnet-4-6`, `gpt-4o`, `kimi-k2.6` |
 | Model base URL | No | leave blank for provider default; required for `ollama`/`ollama-cloud` |
@@ -166,6 +166,12 @@ spec:
         schedule: "0 9 * * *"    # standard cron or shorthand like "every 30m"
         prompt: |
           Summarize overnight alerts and post a digest.
+        monitorScript: source.sh # optional; monitor mode script run each tick before the agent
+        monitorURL: https://example.com/status  # optional; monitor mode URL (instead of monitorScript)
+        model: gpt-5             # optional; pin the job to a specific inference model
+        provider: openrouter     # optional; inference provider paired with model
+        reasoningEffort: high    # optional; none, minimal, low, medium, high, xhigh, max, ultra
+        continuity: false        # optional; inject previous output into each run's prompt
 ```
 
 **SearXNG sidecar:**
