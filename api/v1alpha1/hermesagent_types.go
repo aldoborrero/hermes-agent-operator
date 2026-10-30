@@ -200,6 +200,10 @@ type ManagedResources struct {
 	// networkPolicy is the name of the managed NetworkPolicy.
 	// +optional
 	NetworkPolicy string `json:"networkPolicy,omitempty"`
+	// sessionPodNetworkPolicy is the name of the NetworkPolicy isolating the
+	// terminal backend's session pods.
+	// +optional
+	SessionPodNetworkPolicy string `json:"sessionPodNetworkPolicy,omitempty"`
 	// egressSecret is the name of the managed iron-proxy config and proxy token Secret.
 	// +optional
 	EgressSecret string `json:"egressSecret,omitempty"`

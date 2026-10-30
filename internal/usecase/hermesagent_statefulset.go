@@ -308,6 +308,7 @@ func buildStatefulSet(ha *agentsv1alpha1.HermesAgent, in statefulSetInputs) *app
 	sts = buildHermesContainer(ha, sts)
 	sts = buildSearXNGContainer(ha, sts)
 	sts = buildCamofoxContainer(ha, sts)
+	sts = buildTerminalKubernetesEnv(ha, sts)
 	sts = buildEgressContainer(ha, sts, in.egressTokenNames, in.egressHash)
 
 	// additional user-provided init containers run after the operator-managed ones.

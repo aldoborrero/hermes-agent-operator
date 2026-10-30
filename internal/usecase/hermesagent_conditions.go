@@ -12,19 +12,20 @@ import (
 // Reconciliation reasons for the Ready condition, one per resource reconcile
 // loop so the failing loop is identifiable from the condition alone.
 const (
-	condReasonReconcileSucceeded    = "ReconcileSucceeded"
-	condReasonHermesConfigMapFailed = "HermesConfigMapReconcileFailed"
-	condReasonHermesSecretFailed    = "HermesSecretReconcileFailed"
-	condReasonSearXNGConfigMapFail  = "SearXNGConfigMapReconcileFailed"
-	condReasonSearXNGSecretFailed   = "SearXNGSecretReconcileFailed"
-	condReasonServiceAccountFailed  = "ServiceAccountReconcileFailed"
-	condReasonRoleFailed            = "RoleReconcileFailed"
-	condReasonServiceFailed         = "ServiceReconcileFailed"
-	condReasonIngressFailed         = "IngressReconcileFailed"
-	condReasonNetworkPolicyFailed   = "NetworkPolicyReconcileFailed"
-	condReasonEgressCAFailed        = "EgressCAReconcileFailed"
-	condReasonEgressSecretFailed    = "EgressSecretReconcileFailed"
-	condReasonStatefulSetFailed     = "StatefulSetReconcileFailed"
+	condReasonReconcileSucceeded            = "ReconcileSucceeded"
+	condReasonHermesConfigMapFailed         = "HermesConfigMapReconcileFailed"
+	condReasonHermesSecretFailed            = "HermesSecretReconcileFailed"
+	condReasonSearXNGConfigMapFail          = "SearXNGConfigMapReconcileFailed"
+	condReasonSearXNGSecretFailed           = "SearXNGSecretReconcileFailed"
+	condReasonServiceAccountFailed          = "ServiceAccountReconcileFailed"
+	condReasonRoleFailed                    = "RoleReconcileFailed"
+	condReasonServiceFailed                 = "ServiceReconcileFailed"
+	condReasonIngressFailed                 = "IngressReconcileFailed"
+	condReasonNetworkPolicyFailed           = "NetworkPolicyReconcileFailed"
+	condReasonSessionPodNetworkPolicyFailed = "SessionPodNetworkPolicyReconcileFailed"
+	condReasonEgressCAFailed                = "EgressCAReconcileFailed"
+	condReasonEgressSecretFailed            = "EgressSecretReconcileFailed"
+	condReasonStatefulSetFailed             = "StatefulSetReconcileFailed"
 )
 
 // markReady sets the Ready condition to True with reason ReconcileSucceeded

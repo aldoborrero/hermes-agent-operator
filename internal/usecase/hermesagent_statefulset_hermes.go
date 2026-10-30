@@ -652,3 +652,37 @@ func buildProfileSidecarDotEnvItems(ha *agentsv1alpha1.HermesAgent) []corev1.Key
 	}
 	return items
 }
+
+// buildTerminalKubernetesEnv injects the agent's own pod identity through the
+// downward API, so the `kubernetes` terminal backend can stamp an ownerReference
+// on the session pods it creates and they are garbage-collected with the agent.
+//
+// The agent can also resolve its identity by looking itself up on the pod
+// hostname, but only with `get pods` granted and an extra API call per start;
+// the downward API is free and works even when RBAC is managed elsewhere.
+func buildTerminalKubernetesEnv(ha *agentsv1alpha1.HermesAgent, sts *appsv1.StatefulSet) *appsv1.StatefulSet {
+	if !ha.GetHermes().GetTerminal().GetKubernetes().IsEnabled() {
+		return sts
+	}
+
+	sts = sts.DeepCopy()
+	c := findContainer(sts, hermesContainerName)
+	if c == nil {
+		return sts
+	}
+	c.Env = append(c.Env,
+		corev1.EnvVar{
+			Name: "HERMES_POD_NAME",
+			ValueFrom: &corev1.EnvVarSource{
+				FieldRef: &corev1.ObjectFieldSelector{FieldPath: "metadata.name"},
+			},
+		},
+		corev1.EnvVar{
+			Name: "HERMES_POD_UID",
+			ValueFrom: &corev1.EnvVarSource{
+				FieldRef: &corev1.ObjectFieldSelector{FieldPath: "metadata.uid"},
+			},
+		},
+	)
+	return sts
+}

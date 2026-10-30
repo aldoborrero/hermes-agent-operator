@@ -887,6 +887,9 @@ type Hermes struct {
 	// packages configures language-specific package managers for pre-installing packages before the agent starts.
 	// +optional
 	Packages *HermesPackages `json:"packages,omitempty"`
+	// terminal configures the backend that runs the agent's shell commands.
+	// +optional
+	Terminal *HermesTerminal `json:"terminal,omitempty"`
 	// plugins is a list of plugins to install in the Hermes agent.
 	// +optional
 	Plugins []HermesPlugin `json:"plugins,omitempty"`
@@ -1039,6 +1042,13 @@ func (h *Hermes) GetPackages() *HermesPackages {
 		return nil
 	}
 	return h.Packages
+}
+
+func (h *Hermes) GetTerminal() *HermesTerminal {
+	if h == nil {
+		return nil
+	}
+	return h.Terminal
 }
 
 func (p *HermesPackages) GetPip() *HermesPipPackages {
