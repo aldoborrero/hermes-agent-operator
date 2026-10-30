@@ -804,6 +804,21 @@ func TestBuildPluginsScript(t *testing.T) {
 		}
 	})
 
+	t.Run("installDependencies passes --yes-deps", func(t *testing.T) {
+		got := buildPluginsScript(hermesDefaultProfile, []agentsv1alpha1.HermesPlugin{
+			{Identifier: "honcho", InstallDependencies: true},
+			{Identifier: "owner/hermes-plugin-plain"},
+		})
+
+		wantCmd := `hermes plugins install -p "default" --force --enable --yes-deps "honcho"`
+		if !strings.Contains(got, wantCmd) {
+			t.Errorf("expected install command %q in script, got:\n%s", wantCmd, got)
+		}
+		if strings.Contains(got, `--yes-deps "owner/hermes-plugin-plain"`) {
+			t.Errorf("--yes-deps must only be passed when requested, got:\n%s", got)
+		}
+	})
+
 	t.Run("named profile uses profile in commands and manifest", func(t *testing.T) {
 		got := buildPluginsScript("coder", []agentsv1alpha1.HermesPlugin{
 			{Identifier: "owner/hermes-plugin-foo"},

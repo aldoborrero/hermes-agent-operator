@@ -93,6 +93,9 @@ func buildPluginsScript(profile string, plugins []agentsv1alpha1.HermesPlugin) s
 		if p.Ref != "" {
 			fmt.Fprintf(&cmd, " --ref %q", p.Ref)
 		}
+		if p.InstallDependencies {
+			cmd.WriteString(" --yes-deps")
+		}
 		fmt.Fprintf(&cmd, " %q", p.Identifier)
 		installLines = append(installLines, cmd.String())
 	}

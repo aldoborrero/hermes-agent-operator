@@ -3177,6 +3177,14 @@ spec:
                             identifier is the Git URL or owner/repo shorthand
                             (e.g. "anpicasso/hermes-plugin-chrome-profiles").
                           type: string
+                        installDependencies:
+                          description: |-
+                            installDependencies answers yes to the Python dependencies the plugin
+                            declares (`hermes plugins install --yes-deps`). Without it a headless
+                            install leaves a plugin that declares dependencies installed but disabled,
+                            as for the catalog memory providers (honcho, mem0, ...). Requires a Hermes
+                            that has the flag. Defaults to false.
+                          type: boolean
                         ref:
                           description: |-
                             ref is an optional Git commit SHA to install exactly one immutable
@@ -3623,6 +3631,14 @@ spec:
                                   identifier is the Git URL or owner/repo shorthand
                                   (e.g. "anpicasso/hermes-plugin-chrome-profiles").
                                 type: string
+                              installDependencies:
+                                description: |-
+                                  installDependencies answers yes to the Python dependencies the plugin
+                                  declares (`hermes plugins install --yes-deps`). Without it a headless
+                                  install leaves a plugin that declares dependencies installed but disabled,
+                                  as for the catalog memory providers (honcho, mem0, ...). Requires a Hermes
+                                  that has the flag. Defaults to false.
+                                type: boolean
                               ref:
                                 description: |-
                                   ref is an optional Git commit SHA to install exactly one immutable

@@ -323,6 +323,13 @@ type HermesPlugin struct {
 	// +kubebuilder:validation:Pattern=`^[0-9a-f]{40}$`
 	// +optional
 	Ref string `json:"ref,omitempty"`
+	// installDependencies answers yes to the Python dependencies the plugin
+	// declares (`hermes plugins install --yes-deps`). Without it a headless
+	// install leaves a plugin that declares dependencies installed but disabled,
+	// as for the catalog memory providers (honcho, mem0, ...). Requires a Hermes
+	// that has the flag. Defaults to false.
+	// +optional
+	InstallDependencies bool `json:"installDependencies,omitempty"`
 }
 
 // HermesSkill defines a skill to install via hermes skills install.
